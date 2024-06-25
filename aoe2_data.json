@@ -1,0 +1,25 @@
+{
+    "khmer": {
+        "bonuses": [
+            "Farmers do not require Mills or Town Centers to drop off food.",
+            "Battle Elephants move 15% faster."
+        ],
+        "unique_units": [
+            "Ballista Elephant"
+        ],
+        "hidden_stats": [
+            "Ballista Elephants deal trample damage."
+        ]
+    },
+    "roman": {
+        "bonuses": [
+            "Buildings are 10% cheaper in the Feudal Age, 15% cheaper in the Castle Age, and 20% cheaper in the Imperial Age."
+        ],
+        "unique_units": [
+            "Legionary"
+        ],
+        "hidden_stats": [
+            "Legionaries have increased armor against ranged attacks."
+        ]
+    }
+}
