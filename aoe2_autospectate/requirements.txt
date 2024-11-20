@@ -1,0 +1,6 @@
+playwright
+pyautogui
+opencv-python
+pillow
+numpy
+pygetwindow
