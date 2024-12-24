@@ -10,10 +10,10 @@ class SpectatorCore:
     def __init__(self, config):
         """
         Initialize the spectator core with configuration.
-        
-        Args:
-            config: Configuration object containing necessary settings
         """
+        # Store the config object and initialize all needed attributes
+        self.config = config
+        
         # Screen dimensions and coordinates
         self.minimap_x = config.MINIMAP_X
         self.minimap_y = config.MINIMAP_Y
@@ -25,7 +25,10 @@ class SpectatorCore:
         self.game_area_width = config.GAME_AREA_WIDTH
         self.game_area_height = config.GAME_AREA_HEIGHT
         
-        # Game state
+        # Color configuration
+        self.player_colors_config = config.PLAYER_HSV_RANGES
+        
+        # Game state tracking
         self.game_time = 0
         self.start_time = time.time()
         self.vision_set = False
@@ -36,32 +39,48 @@ class SpectatorCore:
         self.change_history = []
         self.conflict_players = set()
         self.spectate_queue = []
-        self.player_colors = {}
         
-        # Load settings from config
-        self.player_colors_config = config.PLAYER_HSV_RANGES
-        self.game_ages = config.GAME_AGES
+        # Player tracking
+        self.player_focus_time = {}  # Track time spent on each player
+        self.last_player_switch = time.time()
+        self.current_player = None
+        self.min_focus_time = 10  # Minimum seconds to stay on a player
+        self.max_focus_time = 30  # Maximum seconds to stay on a player
         
-        # Load building templates
-        self.building_templates = {}
-        if hasattr(config, 'BUILDING_TEMPLATES'):
-            for building, path in config.BUILDING_TEMPLATES.items():
-                template = cv2.imread(path, cv2.IMREAD_COLOR)
-                if template is not None:
-                    self.building_templates[building] = template
-                else:
-                    logging.error(f"Failed to load template for {building}")
+        # Metrics
+        self.player_switches = 0
+        self.fights_detected = 0
+        self.total_activity = 0
 
-    def capture_minimap(self):
-        """Capture the minimap area of the screen."""
+        # Building tracking
+        self.player_buildings = {}  # Track building locations by player
+
+    def capture_minimap(self, debug=False):
+        """
+        Capture the minimap area of the screen with optional debug visualization.
+        """
         try:
-            screenshot = ImageGrab.grab(bbox=(
-                self.minimap_x,
-                self.minimap_y,
-                self.minimap_x + self.minimap_width,
-                self.minimap_y + self.minimap_height
-            ))
-            return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+            # Calculate coordinates with padding
+            x1 = self.minimap_x - self.config.MINIMAP_PADDING
+            y1 = self.minimap_y - self.config.MINIMAP_PADDING
+            x2 = self.minimap_x + self.minimap_width + self.config.MINIMAP_PADDING
+            y2 = self.minimap_y + self.minimap_height + self.config.MINIMAP_PADDING
+            
+            screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+            frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+            
+            if debug:
+                # Draw a rectangle showing the capture area
+                debug_frame = frame.copy()
+                cv2.rectangle(debug_frame, 
+                            (self.config.MINIMAP_PADDING, self.config.MINIMAP_PADDING),
+                            (self.minimap_width + self.config.MINIMAP_PADDING, 
+                             self.minimap_height + self.config.MINIMAP_PADDING),
+                            (0, 255, 0), 2)
+                cv2.imwrite('debug_minimap_area.png', debug_frame)
+                
+            return frame
+            
         except Exception as e:
             logging.error(f"Error capturing minimap: {e}")
             return None
@@ -80,64 +99,55 @@ class SpectatorCore:
             logging.error(f"Error capturing game area: {e}")
             return None
 
-    def set_permanent_vision(self):
-        """Set permanent vision using hotkeys."""
-        pyautogui.hotkey('alt', 'f')
-        time.sleep(0.5)
-        pyautogui.hotkey('alt', 'f')
-        self.vision_set = True
-        logging.info("Set permanent vision")
-
-    def toggle_stats(self):
-        """Toggle game statistics display."""
-        pyautogui.hotkey('alt', 'c')
-        logging.info("Toggled stats")
-
-    def detect_player_colors(self, image, debug=False):
+    def detect_building_icons(self, minimap_image, debug=False):
         """
-        Detect player colors in the given image with improved accuracy.
-        Returns dict of detected colors with their positions and confidence.
+        Detect TC and Castle icons on the minimap.
+        Returns dict of players with their building positions and types.
         """
-        detected_colors = {}
-        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        debug_image = image.copy() if debug else None
+        active_players = {}
+        hsv_image = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
+        debug_image = minimap_image.copy() if debug else None
         
-        for color_name, hsv_range in self.player_colors_config.items():
-            lower = np.array(hsv_range['lower'], dtype=np.uint8)
-            upper = np.array(hsv_range['upper'], dtype=np.uint8)
+        for player, ranges in self.player_colors_config.items():
+            lower = np.array(ranges['icon']['lower'], dtype=np.uint8)
+            upper = np.array(ranges['icon']['upper'], dtype=np.uint8)
             mask = cv2.inRange(hsv_image, lower, upper)
             
-            # Find contours in the mask
+            # Find contours of potential building icons
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            buildings = []
             
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > 25 and area < 500:  # Player dots should be within this size range
-                    M = cv2.moments(contour)
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        
-                        # Calculate roundness to detect player dots
-                        perimeter = cv2.arcLength(contour, True)
-                        roundness = 4 * np.pi * area / (perimeter * perimeter)
-                        
-                        if roundness > 0.7:  # Player dots are usually round
-                            confidence = (area / 500) * roundness * 100  # Confidence score
-                            detected_colors[color_name] = {
+                if self.config.BUILDING_ICON_MIN_AREA <= area <= self.config.BUILDING_ICON_MAX_AREA:
+                    # Calculate circularity
+                    perimeter = cv2.arcLength(contour, True)
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+                    
+                    if circularity >= self.config.BUILDING_ICON_MIN_CIRCULARITY:
+                        M = cv2.moments(contour)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            buildings.append({
                                 'position': (cx, cy),
-                                'confidence': confidence,
-                                'area': area
-                            }
+                                'area': area,
+                                'type': 'building'
+                            })
                             
                             if debug:
-                                cv2.drawContours(debug_image, [contour], -1, (0, 255, 0), 2)
-                                cv2.circle(debug_image, (cx, cy), 3, (0, 0, 255), -1)
-                                cv2.putText(debug_image, f"{color_name}", (cx-20, cy-10),
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                cv2.circle(debug_image, (cx, cy), 3, (0, 255, 0), -1)
+                                cv2.putText(debug_image, f"{player}", (cx-10, cy-10),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+            
+            if buildings:
+                active_players[player] = buildings
+                self.player_buildings[player] = buildings  # Update tracked buildings
         
-        return detected_colors
-
+        if debug and debug_image is not None:
+            cv2.imwrite('debug_building_icons.png', debug_image)
+            
+        return active_players
     def detect_activity(self, prev_image, curr_image):
         """
         Detect activity between two consecutive frames.
@@ -153,57 +163,87 @@ class SpectatorCore:
         change_magnitude = np.sum(thresh)
         return contours, change_magnitude
 
-    def is_big_fight(self, curr_image, contours):
+    def detect_conflict_near_tc(self, minimap_image, active_players, debug=False):
         """
-        Determine if detected activity represents a significant fight.
-        Returns bool indicating fight status and set of involved players.
+        Detect conflicts near TC locations, prioritizing enemy units near opponent's TCs.
+        Returns list of conflicts with their positions and priorities.
         """
-        # Define area thresholds based on current age
-        age_thresholds = {
-            'Dark Age': 50,
-            'Feudal Age': 100,
-            'Castle Age': 200,
-            'Imperial Age': 300
-        }
-        area_threshold = age_thresholds.get(self.current_age, 100)
+        conflicts = []
+        hsv_image = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
+        debug_image = minimap_image.copy() if debug else None
+        
+        # First, get each player's unit positions
+        player_units = {}
+        for player, ranges in self.player_colors_config.items():
+            if player in active_players:
+                lower = np.array(ranges['normal']['lower'], dtype=np.uint8)
+                upper = np.array(ranges['normal']['upper'], dtype=np.uint8)
+                mask = cv2.inRange(hsv_image, lower, upper)
+                player_units[player] = mask
 
-        if len(contours) < 2:
-            return False, set()
+        # Check for units near opponent TCs
+        players = list(active_players.keys())
+        for i in range(len(players)):
+            for j in range(i+1, len(players)):
+                player1, player2 = players[i], players[j]
+                
+                # Check player1's units near player2's TCs
+                for tc in active_players[player2]:
+                    tc_pos = tc['position']
+                    # Create a circular mask around TC
+                    tc_area_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+                    cv2.circle(tc_area_mask, tc_pos, 30, 255, -1)  # 30 pixel radius around TC
+                    
+                    # Check for player1's units in this area
+                    units_near_tc = cv2.bitwise_and(player_units[player1], tc_area_mask)
+                    if cv2.countNonZero(units_near_tc) > 50:  # Threshold for significant unit presence
+                        conflicts.append({
+                            'position': tc_pos,
+                            'players': (player1, player2),
+                            'priority': 'high',  # High priority for TC conflicts
+                            'type': 'tc_conflict'
+                        })
+                        if debug:
+                            cv2.circle(debug_image, tc_pos, 30, (0, 0, 255), 2)
+                
+                # Do the same for player2's units near player1's TCs
+                for tc in active_players[player1]:
+                    tc_pos = tc['position']
+                    tc_area_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+                    cv2.circle(tc_area_mask, tc_pos, 30, 255, -1)
+                    
+                    units_near_tc = cv2.bitwise_and(player_units[player2], tc_area_mask)
+                    if cv2.countNonZero(units_near_tc) > 50:
+                        conflicts.append({
+                            'position': tc_pos,
+                            'players': (player2, player1),
+                            'priority': 'high',
+                            'type': 'tc_conflict'
+                        })
+                        if debug:
+                            cv2.circle(debug_image, tc_pos, 30, (0, 0, 255), 2)
 
-        large_contours = [c for c in contours if cv2.contourArea(c) > area_threshold]
-        if len(large_contours) < 2:
-            return False, set()
+        if debug and len(conflicts) > 0:
+            cv2.imwrite('debug_conflicts.png', debug_image)
+        
+        return conflicts
 
-        colors_present = set()
-        for contour in large_contours:
-            mask = np.zeros(curr_image.shape[:2], np.uint8)
-            cv2.drawContours(mask, [contour], 0, 255, -1)
-            hsv_image = cv2.cvtColor(curr_image, cv2.COLOR_BGR2HSV)
-            
-            for color_name, hsv_range in self.player_colors_config.items():
-                lower = np.array(hsv_range['lower'], dtype=np.uint8)
-                upper = np.array(hsv_range['upper'], dtype=np.uint8)
-                color_mask = cv2.inRange(hsv_image, lower, upper)
-                color_mask = cv2.bitwise_and(color_mask, mask)
-                if cv2.countNonZero(color_mask) >= 5:
-                    colors_present.add(color_name)
-                    if len(colors_present) >= 2:
-                        return True, colors_present
-                        
-        return False, set()
+    def validate_game_players(self, active_players):
+        """
+        Validate detected players for a 1v1 game.
+        """
+        if len(active_players) != self.config.EXPECTED_PLAYERS_1V1:
+            logging.warning(f"Unexpected player count: {len(active_players)}. Expected {self.config.EXPECTED_PLAYERS_1V1}")
+            return {}
 
-    def find_most_active_area(self, contours):
-        """Find the center of the largest activity area."""
-        if not contours:
-            return None
-            
-        largest_contour = max(contours, key=cv2.contourArea)
-        M = cv2.moments(largest_contour)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            return (cx, cy)
-        return None
+        validated_players = {}
+        for player, buildings in active_players.items():
+            if len(buildings) >= self.config.STARTING_TC_COUNT:
+                validated_players[player] = buildings
+            else:
+                logging.debug(f"Player {player} has no detected buildings")
+
+        return validated_players
 
     def click_and_drag_follow(self, start_x, start_y, end_x, end_y, duration=0.5):
         """Perform click, drag, and follow action."""
@@ -218,128 +258,71 @@ class SpectatorCore:
     def click_minimap(self, x, y):
         """Click a position on the minimap."""
         try:
-            pyautogui.click(self.minimap_x + x, self.minimap_y + y)
-            logging.info(f"Clicked minimap at ({x}, {y})")
+            click_x = self.minimap_x + x
+            click_y = self.minimap_y + y
+            logging.info(f"Clicking minimap at ({click_x}, {click_y})")
+            pyautogui.click(click_x, click_y)
         except pyautogui.FailSafeException:
             logging.error("Fail-safe triggered during minimap click")
 
-    def update_game_age(self):
-        """Update the current game age based on game time."""
-        for age, threshold in reversed(self.game_ages):
-            if self.game_time >= threshold:
-                if self.current_age != age:
-                    self.current_age = age
-                    logging.info(f"Game Age: {age}")
-                break
+    def run_spectator_iteration(self):
+        """Run a single iteration of the spectator logic."""
+        try:
+            curr_minimap = self.capture_minimap()
+            if curr_minimap is None:
+                return
 
-    def find_player_position(self, minimap_image, player_name):
-        """Find a player's position on the minimap."""
-        hsv_range = self.player_colors_config.get(player_name)
-        if not hsv_range:
-            logging.error(f"No color defined for player: {player_name}")
-            return None
+            # Detect active players and their buildings
+            active_players = self.detect_building_icons(curr_minimap)
+            validated_players = self.validate_game_players(active_players)
+            
+            if validated_players:
+                logging.info(f"Active players: {list(validated_players.keys())}")
+                
+                # Detect conflicts near TCs
+                conflicts = self.detect_conflict_near_tc(curr_minimap, validated_players)
+                
+                if conflicts:
+                    # Sort by priority (TC conflicts first)
+                    conflicts.sort(key=lambda x: 0 if x['priority'] == 'high' else 1)
+                    target_conflict = conflicts[0]
+                    
+                    # Focus camera on conflict
+                    self.click_minimap(*target_conflict['position'])
+                    
+                    # Center screen drag
+                    center_x = self.game_area_width // 2
+                    center_y = self.game_area_height // 2
+                    drag_distance = 100
 
-        hsv_image = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
-        lower = np.array(hsv_range['lower'], dtype=np.uint8)
-        upper = np.array(hsv_range['upper'], dtype=np.uint8)
-        mask = cv2.inRange(hsv_image, lower, upper)
-        
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest_contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                return (cx, cy)
-        return None
+                    self.click_and_drag_follow(
+                        center_x - drag_distance,
+                        center_y - drag_distance,
+                        center_x + drag_distance,
+                        center_y + drag_distance,
+                        duration=1.5
+                    )
+                    
+                    logging.info(f"Focusing on {target_conflict['type']} between {target_conflict['players']}")
+                else:
+                    logging.info("No significant conflicts detected")
+            
+        except Exception as e:
+            logging.error(f"Error in spectator iteration: {e}")
 
     def run_spectator(self):
         """Main spectator loop."""
-        prev_minimap = self.capture_minimap()
-        prev_game_area = self.capture_game_area()
-
+        logging.info("Starting spectator")
         while True:
             try:
                 current_time = time.time()
                 self.game_time = int(current_time - self.start_time)
-
-                # Update game age
-                self.update_game_age()
-
-                # Set permanent vision at 10 minutes
-                if self.game_time >= 600 and not self.vision_set:
-                    self.set_permanent_vision()
-
-                # Toggle stats every 10 seconds
-                if current_time - self.last_stats_toggle_time >= 10:
-                    self.toggle_stats()
-                    self.last_stats_toggle_time = current_time
-
-                # Capture current frames
-                curr_minimap = self.capture_minimap()
-                curr_game_area = self.capture_game_area()
-
-                # Detect activity
-                activity_contours_minimap, change_magnitude_minimap = self.detect_activity(
-                    prev_minimap, curr_minimap)
-                activity_contours_game_area, change_magnitude_game_area = self.detect_activity(
-                    prev_game_area, curr_game_area)
-
-                # Track changes for detection
-                self.change_history.append(change_magnitude_game_area)
-                if len(self.change_history) > 10:
-                    self.change_history.pop(0)
-                average_change = sum(self.change_history) / len(self.change_history)
-                big_change_threshold = 1.5 * average_change if average_change > 0 else 1000
-
-                # Handle fights and significant changes
-                is_fight, players_involved = self.is_big_fight(curr_game_area, activity_contours_game_area)
-                is_big_change = change_magnitude_game_area > big_change_threshold
-
-                if (is_fight or is_big_change) and players_involved:
-                    self.conflict_players.update(players_involved)
-
-                    if current_time - self.last_fight_time >= 15 and self.conflict_players:
-                        if not self.spectate_queue:
-                            self.spectate_queue = list(self.conflict_players)
-                            random.shuffle(self.spectate_queue)
-
-                        player_to_follow = self.spectate_queue.pop(0)
-                        self.conflict_players.discard(player_to_follow)
-
-                        player_position = self.find_player_position(curr_minimap, player_to_follow)
-                        if player_position:
-                            time.sleep(1)
-                            self.click_minimap(*player_position)
-
-                            # Center screen drag
-                            center_x = self.game_area_width // 2
-                            center_y = self.game_area_height // 2
-                            drag_distance = 100
-
-                            self.click_and_drag_follow(
-                                center_x - drag_distance,
-                                center_y - drag_distance,
-                                center_x + drag_distance,
-                                center_y + drag_distance,
-                                duration=1.5
-                            )
-
-                            self.last_fight_time = current_time
-                            time.sleep(10)
-
-                elif current_time - self.last_action_time >= 2:
-                    active_point = self.find_most_active_area(activity_contours_minimap)
-                    if active_point:
-                        time.sleep(1)
-                        self.click_minimap(*active_point)
-                    self.last_action_time = current_time
-
-                prev_minimap = curr_minimap
-                prev_game_area = curr_game_area
-                time.sleep(0.5)
+                
+                # Run a single iteration
+                self.run_spectator_iteration()
+                
+                time.sleep(0.5)  # Short sleep to prevent excessive CPU usage
 
             except Exception as e:
                 logging.error(f"Error in spectator loop: {e}")
-                time.sleep(1)
+                time.sleep(1)  # Wait before retrying
