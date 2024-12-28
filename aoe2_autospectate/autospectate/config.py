@@ -1,9 +1,9 @@
 # Screen Coordinates
-MINIMAP_X = 760       # Base X position
+MINIMAP_X = 730       # Base X position
 MINIMAP_Y = 840       # Base Y position
-MINIMAP_WIDTH = 350   # Width of capture area
-MINIMAP_HEIGHT = 300  # Height of capture area
-MINIMAP_PADDING = 50  # Padding around minimap
+MINIMAP_WIDTH = 460   # Width of capture area
+MINIMAP_HEIGHT = 280  # Height of capture area
+MINIMAP_PADDING = 10  # Padding around minimap
 
 # Game Area
 GAME_AREA_X = 0
