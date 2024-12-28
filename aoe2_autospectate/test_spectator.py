@@ -7,10 +7,7 @@ from autospectate.spectator_core import SpectatorCore
 from autospectate.config import (
     MINIMAP_X, MINIMAP_Y, MINIMAP_WIDTH, MINIMAP_HEIGHT,
     GAME_AREA_X, GAME_AREA_Y, GAME_AREA_WIDTH, GAME_AREA_HEIGHT,
-    PLAYER_HSV_RANGES, GAME_AGES, MINIMAP_PADDING,
-    BUILDING_ICON_MIN_AREA, BUILDING_ICON_MAX_AREA, BUILDING_ICON_MIN_CIRCULARITY,
-    MAX_PLAYERS, EXPECTED_PLAYERS_1V1, STARTING_TC_COUNT,
-    AOE2_COMPANION_URL, GAME_MODE_FILTER
+    PLAYER_HSV_RANGES, GAME_AGES, MINIMAP_PADDING
 )
 
 def setup_logging():
@@ -31,40 +28,65 @@ def test_screen_capture(spectator):
     if minimap is not None:
         logging.info("[PASS] Minimap capture successful")
         cv2.imwrite('debug_minimap.png', minimap)
+        
+        # Generate territory visualization if in debug mode
+        if spectator.debug_mode:
+            spectator.territory_tracker.visualize_territories(minimap)
+            logging.info("Territory visualization saved")
     else:
         logging.error("[FAIL] Minimap capture failed")
-    
-    game_area = spectator.capture_game_area()
-    if game_area is not None:
-        logging.info("[PASS] Game area capture successful")
-        cv2.imwrite('debug_game_area.png', game_area)
-    else:
-        logging.error("[FAIL] Game area capture failed")
 
-
-
-
-
-def test_color_detection(spectator):
-    """Test color detection on current screen with visual debug"""
-    logging.info("Testing color detection...")
+def test_territory_detection(spectator):
+    """Test territory and heat map generation"""
+    logging.info("Testing territory detection...")
     
     minimap = spectator.capture_minimap()
     if minimap is not None:
-        active_players = spectator.detect_building_icons(minimap, debug=True)
-        if active_players:
-            logging.info("Detected players:")
-            for player_name, buildings in active_players.items():
-                for building in buildings:
-                    logging.info(f"  - {player_name}: Position {building['position']}, "
-                               f"Area {building['area']}, Type {building['type']}")
+        # Update territory tracker
+        spectator.territory_tracker.update(minimap, spectator.player_colors_config, spectator.active_colors)
+        
+        # Log territory information
+        for color in spectator.active_colors:
+            territory = spectator.territory_tracker.territories.get(color, {})
+            if territory.get('main_base'):
+                logging.info(f"{color} main base detected at {territory['main_base']['position']}")
+            
+            forward_positions = territory.get('forward_positions', [])
+            logging.info(f"{color} has {len(forward_positions)} forward positions")
+            
+        # Generate heat map visualization
+        if spectator.territory_tracker.heat_map is not None:
+            heat_vis = (spectator.territory_tracker.heat_map * 255).astype(np.uint8)
+            heat_vis = cv2.applyColorMap(heat_vis, cv2.COLORMAP_JET)
+            cv2.imwrite('debug_heatmap.png', heat_vis)
+            logging.info("Heat map visualization saved")
+
+def test_raid_detection(spectator):
+    """Test raid detection system"""
+    logging.info("Testing raid detection...")
+    
+    minimap = spectator.capture_minimap()
+    if minimap is not None:
+        # Update territory understanding
+        spectator.territory_tracker.update(minimap, spectator.player_colors_config, spectator.active_colors)
+        
+        # Check for raids
+        raids = spectator.territory_tracker.detect_raids(minimap, spectator.player_colors_config)
+        
+        if raids:
+            logging.info(f"Detected {len(raids)} potential raids:")
+            for raid in raids:
+                logging.info(f"  - {raid['attacker']} raiding {raid['defender']} "
+                           f"(importance: {raid['importance']:.2f})")
+                           
+            # Visualize raids on debug image
+            debug_img = minimap.copy()
+            for raid in raids:
+                x, y = raid['position']
+                cv2.circle(debug_img, (x, y), 15, (0, 0, 255), 2)
+            cv2.imwrite('debug_raids.png', debug_img)
         else:
-            logging.info("No player buildings detected")
-
-
-
-
-
+            logging.info("No raids detected")
 
 def test_activity_detection(spectator):
     """Test activity detection between frames"""
@@ -76,13 +98,18 @@ def test_activity_detection(spectator):
     curr_minimap = spectator.capture_minimap()
     
     if prev_minimap is not None and curr_minimap is not None:
-        contours, magnitude = spectator.detect_activity(prev_minimap, curr_minimap)
-        logging.info(f"Activity magnitude: {magnitude}")
-        logging.info(f"Number of activity contours: {len(contours)}")
+        # Detect regular activity
+        new_zones = spectator.detect_activity_zones(curr_minimap)
         
-        # Draw activity areas on debug image
+        logging.info(f"Found {len(new_zones)} activity zones")
+        
+        # Visualize activity
         debug_image = curr_minimap.copy()
-        cv2.drawContours(debug_image, contours, -1, (0, 255, 0), 2)
+        for zone in new_zones:
+            x, y = zone['position']
+            color = (0, 255, 0) if zone['color'] == 'Blue' else (0, 0, 255)
+            cv2.circle(debug_image, (x, y), int(zone['area'] ** 0.5), color, 2)
+        
         cv2.imwrite('debug_activity.png', debug_image)
 
 def test_spectate_timed(spectator, duration):
@@ -98,19 +125,6 @@ def test_spectate_timed(spectator, duration):
             iteration += 1
             logging.info(f"Test iteration {iteration}")
             
-            # Capture current state
-            minimap = spectator.capture_minimap()
-            game_area = spectator.capture_game_area()
-            
-            if minimap is None or game_area is None:
-                logging.error("Failed to capture screen")
-                continue
-            
-            # Detect buildings and active players
-            active_players = spectator.detect_building_icons(minimap)
-            if active_players:
-                logging.info(f"Current active players: {list(active_players.keys())}")
-            
             # Run spectator logic
             spectator.run_spectator_iteration()
             
@@ -118,14 +132,15 @@ def test_spectate_timed(spectator, duration):
             time_remaining = int(end_time - time.time())
             logging.info(f"Time remaining: {time_remaining}s")
             
-            # Short sleep to prevent excessive CPU usage
+            # Save debug visuals periodically if enabled
+            if spectator.debug_mode and iteration % 10 == 0:
+                minimap = spectator.capture_minimap()
+                if minimap is not None:
+                    spectator.territory_tracker.visualize_territories(minimap)
+            
             time.sleep(0.5)
         
-        # Log test results
         logging.info(f"Test completed. Duration: {duration} seconds")
-        logging.info(f"Player switches: {spectator.player_switches}")
-        logging.info(f"Fights detected: {spectator.fights_detected}")
-        logging.info(f"Average activity level: {spectator.total_activity / duration:.2f}")
         
     except KeyboardInterrupt:
         logging.info("Test stopped by user")
@@ -136,7 +151,8 @@ def main():
     parser = argparse.ArgumentParser(description='Test AoE2 Spectator functionality')
     parser.add_argument('--test-all', action='store_true', help='Run all tests')
     parser.add_argument('--test-capture', action='store_true', help='Test screen capture')
-    parser.add_argument('--test-colors', action='store_true', help='Test color detection')
+    parser.add_argument('--test-territories', action='store_true', help='Test territory detection')
+    parser.add_argument('--test-raids', action='store_true', help='Test raid detection')
     parser.add_argument('--test-activity', action='store_true', help='Test activity detection')
     parser.add_argument('--test-spectate', action='store_true', help='Test spectate functionality')
     parser.add_argument('--timed-test', type=int, help='Run a timed test for specified seconds')
@@ -157,18 +173,11 @@ def main():
         'GAME_AREA_WIDTH': GAME_AREA_WIDTH,
         'GAME_AREA_HEIGHT': GAME_AREA_HEIGHT,
         'PLAYER_HSV_RANGES': PLAYER_HSV_RANGES,
-        'GAME_AGES': GAME_AGES,
-        'BUILDING_ICON_MIN_AREA': BUILDING_ICON_MIN_AREA,
-        'BUILDING_ICON_MAX_AREA': BUILDING_ICON_MAX_AREA,
-        'BUILDING_ICON_MIN_CIRCULARITY': BUILDING_ICON_MIN_CIRCULARITY,
-        'MAX_PLAYERS': MAX_PLAYERS,
-        'EXPECTED_PLAYERS_1V1': EXPECTED_PLAYERS_1V1,
-        'STARTING_TC_COUNT': STARTING_TC_COUNT,
-        'AOE2_COMPANION_URL': AOE2_COMPANION_URL,
-        'GAME_MODE_FILTER': GAME_MODE_FILTER
+        'GAME_AGES': GAME_AGES
     })()
     
     spectator = SpectatorCore(config)
+    spectator.debug_mode = args.debug_visual
     
     try:
         if args.timed_test:
@@ -178,20 +187,24 @@ def main():
         if args.test_all or args.test_capture:
             test_screen_capture(spectator)
             
-        if args.test_all or args.test_colors:
-            test_color_detection(spectator)
+        if args.test_all or args.test_territories:
+            test_territory_detection(spectator)
+            
+        if args.test_all or args.test_raids:
+            test_raid_detection(spectator)
             
         if args.test_all or args.test_activity:
             test_activity_detection(spectator)
             
         if args.test_all or args.test_spectate:
-            # Regular spectate test
             spectator.run_spectator()
             
     except KeyboardInterrupt:
         logging.info("Testing stopped by user")
     except Exception as e:
         logging.error(f"Error during testing: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
 
 if __name__ == "__main__":
     main()
