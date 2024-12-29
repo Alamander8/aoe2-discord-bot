@@ -1,0 +1,157 @@
+AoE2 AutoSpectate Project Documentation
+Project Structure
+Copyaoe2_autospectate/
+├── autospectate/
+│   ├── __init__.py
+│   ├── main.py              # Main entry point
+│   ├── config.py            # Configuration settings
+│   ├── spectator_core.py    # Core spectating logic
+│   ├── web_automation.py    # Game finding automation
+│   └── windows_management.py # Window management
+├── test_spectator.py        # Testing script
+├── requirements.txt
+└── README.md
+Recent Changes and Current State
+Core Components
+
+SpectatorCore Class
+
+Handles all spectating logic
+Manages player detection and tracking
+Implements time-based player switching
+Controls mouse movements and keyboard inputs
+
+
+Configuration System
+
+Screen coordinates for minimap and game area
+HSV color ranges for player detection
+Timing thresholds for player switching
+Game stage definitions
+
+
+Testing Framework
+
+Standalone test script
+Visual debugging capabilities
+Timed test runs
+Component-specific tests
+
+
+
+Key Features
+
+Player Detection
+
+HSV-based color detection
+Contour analysis for player positions
+Confidence scoring system
+Position tracking
+
+
+Camera Control
+
+Minimap clicking
+Click-and-drag following
+Center screen adjustments
+Automatic player switching
+
+
+Time Management
+
+Minimum focus time: 10 seconds
+Maximum focus time: 30 seconds
+Activity-based switching
+Fair distribution of viewing time
+
+
+
+Testing
+Running Tests
+bashCopy# Run all tests with visual debugging
+python test_spectator.py --test-all --debug-visual
+
+# Run a timed test (e.g., 30 seconds)
+python test_spectator.py --timed-test 30
+
+# Individual component tests
+python test_spectator.py --test-capture    # Test screen capture
+python test_spectator.py --test-colors     # Test color detection
+python test_spectator.py --test-activity   # Test activity detection
+Test Components
+
+Screen Capture Test
+
+Validates minimap capture
+Validates game area capture
+Saves debug images
+
+
+Color Detection Test
+
+Tests player color detection
+Validates position detection
+Provides confidence scores
+
+
+Activity Detection Test
+
+Measures screen changes
+Detects player movements
+Identifies combat areas
+
+
+Timed Spectating Test
+
+Runs full spectating system
+Logs player switches
+Tracks viewing statistics
+
+
+
+Areas for Future Improvement
+
+Decision Making
+
+Refine player switching criteria
+Improve combat detection
+Better handle multiple simultaneous actions
+
+
+Visual Detection
+
+Fine-tune HSV ranges
+Improve player dot detection
+Better handle terrain interference
+
+
+Camera Control
+
+Optimize drag distances
+Improve follow behavior
+Add smoothing to movements
+
+
+Testing System
+
+Add more metrics
+Improve visual debugging
+Add performance benchmarks
+
+
+
+Current Limitations
+
+Screen coordinates are hardcoded for specific resolutions
+Color detection can be affected by terrain
+No automatic game stage detection
+Limited combat detection capabilities
+
+Notes for Development
+
+The system uses HSV color space for better color detection
+Player switching has both time and activity-based triggers
+All mouse movements use relative coordinates
+Test script provides immediate feedback on system performance
+
+Remember to check the coordinates in config.py match your screen resolution before running the system.

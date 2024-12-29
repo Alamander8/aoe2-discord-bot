@@ -1,0 +1,78 @@
+# AoE2 AutoSpectator Project Notes
+December 27, 2024
+
+## Overview
+Today we significantly improved the AutoSpectator's ability to understand and react to game state by implementing a sophisticated territory tracking and combat detection system. The main improvements focused on three key areas: territory understanding, raid detection, and intelligent camera management.
+
+## Key Components
+
+### Territory Tracker
+- Implemented a heat map-based system for tracking player territories
+- Uses HSV color detection to identify player-controlled areas
+- Distinguishes between main bases and forward positions
+- Continuously updates territory understanding as the game progresses
+
+### Forward Position Detection
+- Enhanced distance-based detection using strategic thresholds
+- Calculates strategic value based on distance from main base and size
+- Prevents false positives from walls and nearby structures
+- Uses morphological operations to clean up noise in detection
+
+### Raid Detection System
+- Identifies enemy units in friendly territory
+- Uses importance scoring (0.0-1.0) to prioritize significant raids
+- Considers unit density and strategic positioning
+- Implements probabilistic viewing for lower-importance raids to maintain variety
+
+### Camera Management
+- Prioritizes high-importance combat (>0.8 importance)
+- Uses randomization for medium and low importance events
+- Maintains viewing queue for regular activities
+- Implements minimum view durations to prevent rapid switching
+
+## Technical Details
+
+### Territory Analysis
+- Main bases identified by sustained high unit/building density
+- Forward positions must be >100 pixels from main base
+- Uses strategic value calculation: (distance / min_distance) * (area / 100)
+- Heat maps updated every 2 seconds
+
+### Combat Detection
+- High importance (>0.8): Always viewed
+- Medium importance (0.6-0.8): 70% chance to view
+- Low importance (<0.6): 30% chance to view
+- Uses moment calculations for precise position detection
+
+### Viewing Pattern Improvements
+- Random selection from top 3 forward positions
+- Importance threshold randomization (0.3-0.7) for normal activities
+- Random selection from top 5 valid zones
+- Minimum 3-second view duration, maximum 6-second
+
+## Results
+The system successfully:
+- Identifies and tracks player territories
+- Detects and prioritizes combat events
+- Maintains engaging viewing patterns
+- Balances between combat focus and base monitoring
+
+## Future Improvements
+Consider:
+1. Territory change tracking over time
+2. Combat prediction based on unit movements
+3. Economic activity detection
+4. Multi-player support beyond 1v1
+5. Game stage awareness for priority adjustment
+
+## Key Lessons
+1. Balance between focused combat viewing and variety is crucial
+2. Distance thresholds are critical for forward position detection
+3. Probabilistic viewing decisions prevent stale camera work
+4. Heat maps provide reliable territory understanding
+
+## Usage Notes
+- Debug visualizations available with --debug-visual flag
+- Territory updates occur every 2 seconds
+- System works best with clear color differentiation
+- Forward position detection may need tuning for different map sizes

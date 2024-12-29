@@ -21,57 +21,97 @@ def setup_logging():
     )
 
 def test_screen_capture(spectator):
-    """Test screen capture functionality"""
+    """Test screen capture functionality with mask support"""
     logging.info("Testing screen capture...")
     
     minimap = spectator.capture_minimap()
     if minimap is not None:
+        # Get mask
+        mask = spectator.calculate_minimap_mask(minimap)
+        if mask is None:
+            logging.error("Failed to generate minimap mask")
+            return
+
         logging.info("[PASS] Minimap capture successful")
-        cv2.imwrite('debug_minimap.png', minimap)
+        
+        # Save masked minimap
+        masked_minimap = minimap.copy()
+        masked_minimap[mask == 0] = [128, 128, 128]
+        cv2.imwrite('debug_minimap.png', masked_minimap)
         
         # Generate territory visualization if in debug mode
         if spectator.debug_mode:
-            spectator.territory_tracker.visualize_territories(minimap)
+            spectator.territory_tracker.visualize_territories(minimap, mask)
             logging.info("Territory visualization saved")
     else:
         logging.error("[FAIL] Minimap capture failed")
 
 def test_territory_detection(spectator):
-    """Test territory and heat map generation"""
+    """Test territory and heat map generation with proper mask usage"""
     logging.info("Testing territory detection...")
     
     minimap = spectator.capture_minimap()
     if minimap is not None:
-        # Update territory tracker
-        spectator.territory_tracker.update(minimap, spectator.player_colors_config, spectator.active_colors)
+        # Get the minimap mask
+        mask = spectator.calculate_minimap_mask(minimap)
+        if mask is None:
+            logging.error("Failed to generate minimap mask")
+            return
+
+        # Update territory tracker with mask
+        spectator.territory_tracker.update(minimap, spectator.player_colors_config, 
+                                         spectator.active_colors, mask)
         
         # Log territory information
         for color in spectator.active_colors:
             territory = spectator.territory_tracker.territories.get(color, {})
             if territory.get('main_base'):
                 logging.info(f"{color} main base detected at {territory['main_base']['position']}")
-            
-            forward_positions = territory.get('forward_positions', [])
-            logging.info(f"{color} has {len(forward_positions)} forward positions")
-            
-        # Generate heat map visualization
+        
+        # Generate heat map visualization with mask
         if spectator.territory_tracker.heat_map is not None:
-            heat_vis = (spectator.territory_tracker.heat_map * 255).astype(np.uint8)
+            # Create visualization mask
+            vis_mask = mask > 0
+            
+            # Create heat map visualization
+            heat_vis = np.zeros_like(spectator.territory_tracker.heat_map)
+            heat_vis[vis_mask] = spectator.territory_tracker.heat_map[vis_mask]
+            
+            # Convert to uint8 and apply colormap
+            heat_vis = (heat_vis * 255).astype(np.uint8)
             heat_vis = cv2.applyColorMap(heat_vis, cv2.COLORMAP_JET)
+            
+            # Apply mask for non-playable areas
+            heat_vis[~vis_mask] = [128, 128, 128]
+            
             cv2.imwrite('debug_heatmap.png', heat_vis)
             logging.info("Heat map visualization saved")
 
+        # Save mask visualization for debugging
+        if spectator.debug_mode:
+            mask_vis = mask.copy()
+            mask_vis = (mask_vis * 255).astype(np.uint8)
+            cv2.imwrite('debug_mask.png', mask_vis)
+
+
 def test_raid_detection(spectator):
-    """Test raid detection system"""
+    """Test raid detection system with proper mask usage"""
     logging.info("Testing raid detection...")
     
     minimap = spectator.capture_minimap()
     if minimap is not None:
-        # Update territory understanding
-        spectator.territory_tracker.update(minimap, spectator.player_colors_config, spectator.active_colors)
+        # Get the minimap mask
+        mask = spectator.calculate_minimap_mask(minimap)
+        if mask is None:
+            logging.error("Failed to generate minimap mask")
+            return
+
+        # Update territory understanding with mask
+        spectator.territory_tracker.update(minimap, spectator.player_colors_config, 
+                                         spectator.active_colors, mask)
         
-        # Check for raids
-        raids = spectator.territory_tracker.detect_raids(minimap, spectator.player_colors_config)
+        # Check for raids with mask
+        raids = spectator.territory_tracker.detect_raids(minimap, spectator.player_colors_config, mask)
         
         if raids:
             logging.info(f"Detected {len(raids)} potential raids:")
@@ -79,17 +119,26 @@ def test_raid_detection(spectator):
                 logging.info(f"  - {raid['attacker']} raiding {raid['defender']} "
                            f"(importance: {raid['importance']:.2f})")
                            
-            # Visualize raids on debug image
+            # Visualize raids on debug image with mask consideration
             debug_img = minimap.copy()
+            
+            # Gray out non-playable areas
+            debug_img[mask == 0] = [128, 128, 128]
+            
+            # Draw raids only in valid areas
             for raid in raids:
                 x, y = raid['position']
-                cv2.circle(debug_img, (x, y), 15, (0, 0, 255), 2)
+                if mask[y, x]:  # Only draw if in valid area
+                    importance_scaled = int(raid['importance'] * 255)
+                    color = (0, importance_scaled, 255 - importance_scaled)
+                    cv2.circle(debug_img, (x, y), 15, color, 2)
+            
             cv2.imwrite('debug_raids.png', debug_img)
         else:
             logging.info("No raids detected")
 
 def test_activity_detection(spectator):
-    """Test activity detection between frames"""
+    """Test activity detection between frames with proper mask usage"""
     logging.info("Testing activity detection...")
     
     prev_minimap = spectator.capture_minimap()
@@ -98,17 +147,26 @@ def test_activity_detection(spectator):
     curr_minimap = spectator.capture_minimap()
     
     if prev_minimap is not None and curr_minimap is not None:
-        # Detect regular activity
-        new_zones = spectator.detect_activity_zones(curr_minimap)
+        # Get mask for both frames
+        mask = spectator.calculate_minimap_mask(curr_minimap)
+        if mask is None:
+            logging.error("Failed to generate minimap mask")
+            return
+            
+        # Detect regular activity with mask
+        new_zones = spectator.detect_activity_zones(curr_minimap, mask)
         
         logging.info(f"Found {len(new_zones)} activity zones")
         
-        # Visualize activity
+        # Visualize activity with mask
         debug_image = curr_minimap.copy()
+        debug_image[mask == 0] = [128, 128, 128]  # Gray out non-playable areas
+        
         for zone in new_zones:
             x, y = zone['position']
-            color = (0, 255, 0) if zone['color'] == 'Blue' else (0, 0, 255)
-            cv2.circle(debug_image, (x, y), int(zone['area'] ** 0.5), color, 2)
+            if mask[y, x]:  # Only draw if in valid area
+                color = (0, 255, 0) if zone['color'] == 'Blue' else (0, 0, 255)
+                cv2.circle(debug_image, (x, y), int(zone['area'] ** 0.5), color, 2)
         
         cv2.imwrite('debug_activity.png', debug_image)
 
