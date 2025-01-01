@@ -7,6 +7,7 @@ import logging
 import random
 from collections import deque
 from typing import Dict, List, Tuple, Optional
+from threading import Lock 
 
 class ViewingQueue:
     def __init__(self, min_revisit_time: float = 4.0, proximity_radius: int = 50):
@@ -14,10 +15,39 @@ class ViewingQueue:
         self.viewed_positions = {}
         self.min_revisit_time = min_revisit_time
         self.proximity_radius = proximity_radius
+        
+        # New tracking attributes
+        self.view_counts = {}  # Track how many times we've viewed each area
+        self.last_base_visit = {}  # Track when we last visited each base
+        self.staleness_threshold = 3  # Number of views before applying staleness
+        self.base_visit_interval = 45.0  # Seconds between forced base checks
+        self.max_view_count = 5
+        self.staleness_penalty = 0.7
 
     def add_zone(self, zone: dict) -> None:
         if self._is_new_area(zone['position']):
+            pos_key = f"{zone['position'][0]},{zone['position'][1]}"
+            view_count = self.view_counts.get(pos_key, 0)
+            
+            # Enhanced staleness penalty
+            if view_count > self.staleness_threshold:
+                # Apply stronger penalty for static positions
+                if not zone.get('is_moving', False):
+                    zone['importance'] *= max(0.3, self.staleness_penalty ** (view_count - self.staleness_threshold))
+                else:
+                    # Lighter penalty for moving units
+                    zone['importance'] *= max(0.5, 0.9 ** (view_count - self.staleness_threshold))
+            
             self.queue.append(zone)
+            self.view_counts[pos_key] = view_count + 1
+            
+            # Cap view count to prevent integer overflow
+            if self.view_counts[pos_key] > self.max_view_count:
+                self.view_counts[pos_key] = self.max_view_count
+
+    def get_current_view(self) -> Optional[dict]:
+        """Get the currently viewed zone without removing it from queue"""
+        return self.queue[0] if self.queue else None
 
     def _is_new_area(self, pos: Tuple[int, int]) -> bool:
         current_time = time.time()
@@ -37,13 +67,184 @@ class ViewingQueue:
             zone = self.queue.popleft()
             if self._is_new_area(zone['position']):
                 self.viewed_positions[zone['position']] = time.time()
+                
+                # Record if this is a base visit
+                if zone.get('type') == 'base_development':
+                    self.record_base_visit(zone.get('color'))
+                
                 return zone
         return None
+    
+    def boost_base_priority(self, color):
+        """Add a high-priority base check to the queue"""
+        # This should be called by SpectatorCore which has access to base positions
+        base_zone = {
+            'position': None,  # Will be set by SpectatorCore
+            'importance': 0.6,  # High importance to ensure it gets viewed
+            'type': 'base_development',
+            'color': color,
+            'timestamp': time.time()
+        }
+        self.queue.appendleft(base_zone)  # Add to front of queue
+
+    def record_base_visit(self, color):
+        """Record when we visit a base"""
+        if color:
+            self.last_base_visit[color] = time.time()
+
+    def reset_view_count(self, position):
+        """Reset view count when we've moved far away"""
+        pos_key = f"{position[0]},{position[1]}"
+        for key in list(self.view_counts.keys()):
+            x, y = map(int, key.split(','))
+            dx = position[0] - x
+            dy = position[1] - y
+            if (dx*dx + dy*dy) > (self.proximity_radius * 2) ** 2:
+                self.view_counts[key] = 0
 
     def clear(self) -> None:
         self.queue.clear()
         self.viewed_positions.clear()
+        self.view_counts.clear()
+        self.last_base_visit.clear()
 
+    def calculate_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
+        """Calculate Euclidean distance between two positions"""
+        return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+
+
+
+
+class BaseMonitor:
+    def __init__(self, spectator_core):
+        self.spectator_core = spectator_core
+        self.last_base_check = {}
+        self.base_check_interval = 35  # seconds
+        self.min_base_view_time= 3.0
+        self.growth_areas = {}
+        self.last_positions = {}  # To track previous positions for growth detection
+        self.forced_base_views={}
+        self.last_base_view ={'Blue': 0, 'Red': 0}
+        self.minimum_interval_between_checks = 10.0
+        self.viewing_times = {'Blue': 0, 'Red': 0}
+        self.last_view_update = time.time()
+        
+    def should_check_base(self, player_color, current_time):
+        """Now returns a priority instead of forcing immediate view"""
+        last_check = self.last_base_check.get(player_color, 0)
+        if current_time - last_check >= self.base_check_interval:
+            self.last_base_check[player_color] = current_time
+            return True
+        return False
+
+    def update_viewing_times(self, current_color, current_time):
+        """Track viewing time per player"""
+        if current_color:
+            time_delta = current_time - self.last_view_update
+            self.viewing_times[current_color] = self.viewing_times.get(current_color, 0) + time_delta
+        self.last_view_update = current_time
+
+    def get_balance_multiplier(self, color):
+        """Get multiplier to balance viewing time between players"""
+        total_time = sum(self.viewing_times.values())
+        if total_time == 0:
+            return 1.0
+        
+        other_color = 'Red' if color == 'Blue' else 'Blue'
+        color_percentage = self.viewing_times.get(color, 0) / total_time
+        
+        if color_percentage > 0.6:  # If we've spent more than 60% time on one player
+            return 0.7  # Reduce importance
+        elif color_percentage < 0.4:  # If we've spent less than 40% time
+            return 1.4  # Increase importance
+        return 1.0
+    def get_tc_position(self, player_color):
+        """Returns the TC position for the given player color"""
+        if player_color in self.spectator_core.territory_tracker.territories:
+            base = self.spectator_core.territory_tracker.territories[player_color]['main_base']
+            if base:
+                return base['position']
+        return None
+
+
+    def is_force_viewing_base(self, current_time):
+        """Check if we're currently in a forced base view"""
+        for color, end_time in list(self.forced_base_views.items()):
+            if current_time < end_time:
+                return True
+            else:
+                del self.forced_base_views[color]
+        return False
+
+
+
+    def get_next_growth_area(self, player_color):
+        """Returns highest activity area in player's territory that matches player's color"""
+        if player_color not in self.spectator_core.territory_tracker.territories:
+            return None
+            
+        current_minimap = self.spectator_core.capture_minimap()
+        if current_minimap is None:
+            return self.get_tc_position(player_color)
+                    
+        player_density = self.spectator_core.territory_tracker.get_color_density(
+            current_minimap,
+            player_color,
+            self.spectator_core.player_colors_config
+        )
+        
+        if player_density is None:
+            return self.get_tc_position(player_color)
+            
+        # Get main base position as reference
+        base_pos = self.get_tc_position(player_color)
+        if not base_pos:
+            return None
+            
+        # Look for highest density of PLAYER'S units/buildings in their territory
+        base_x, base_y = base_pos
+        search_radius = 100
+        
+        y_start = max(0, base_y - search_radius)
+        y_end = min(player_density.shape[0], base_y + search_radius)
+        x_start = max(0, base_x - search_radius)
+        x_end = min(player_density.shape[1], base_x + search_radius)
+        
+        # Get region around base
+        roi = player_density[y_start:y_end, x_start:x_end]
+        
+        # Find highest density position
+        max_y, max_x = np.unravel_index(np.argmax(roi), roi.shape)
+        actual_x = x_start + max_x
+        actual_y = y_start + max_y
+        
+        # Verify the point has meaningful activity
+        if player_density[actual_y, actual_x] > 0.2:  # Threshold to ensure we find actual activity
+            return (actual_x, actual_y)
+        return base_pos  # Fallback to TC if no significant activity found
+    
+    def track_base_growth(self, player_color, current_frame):
+        """Track base growth for a player"""
+        if player_color not in self.growth_areas:
+            self.growth_areas[player_color] = []
+            
+        # Compare with previous frame to detect new structures
+        new_structures = self.detect_new_structures(player_color, current_frame)
+        if new_structures:
+            self.growth_areas[player_color].extend(new_structures)
+            
+        # Prune old growth areas after certain time
+        self.prune_old_areas(player_color)
+    
+    def detect_new_structures(self, player_color, current_frame):
+        """Detects new structures in the current frame"""
+        # For now, returning empty list until we implement detection
+        return []
+        
+    def prune_old_areas(self, player_color):
+        """Removes old growth areas"""
+        # Will implement pruning logic later
+        pass
 
 
 class SpectatorCore:
@@ -58,6 +259,17 @@ class SpectatorCore:
         self.game_area_y = config.GAME_AREA_Y
         self.game_area_width = config.GAME_AREA_WIDTH
         self.game_area_height = config.GAME_AREA_HEIGHT
+        self.game_start_time = time.time()
+        self.last_minimap = None
+        self.current_mask = None
+        self.minimap_lock = Lock() 
+        self.last_military_check = 0
+        self.military_check_interval = 12.0
+        self.recent_visits = []
+        self.last_density_map = None
+
+        #initialize
+        self.base_monitor = BaseMonitor(self)
         
         # Color configuration
         self.player_colors_config = config.PLAYER_HSV_RANGES
@@ -67,15 +279,20 @@ class SpectatorCore:
         self.large_activity_threshold = 150
         
         # Timing settings
-        self.min_view_duration = 3.0
+        self.min_view_duration = 4.0
         self.max_view_duration = 6.0
+        self.combat_view_duration = 12.0
         self.last_switch_time = time.time()
+        self.last_visit_times = {
+        'Blue': {'military': 0, 'economy': 0},
+        'Red': {'military': 0, 'economy': 0}
+    }
         
 
         # Previous frame storage for movement detection
         self.prev_frame = None
-        self.movement_weight = 0.4  # Moderate boost for movement
-        self.static_weight = 0.6    # Still significant weight for static elements
+        self.movement_weight = 0.7  # Moderate boost for movement
+        self.static_weight = 0.3  # Still significant weight for static elements
 
         # Initialize territory tracker and viewing queue
         self.territory_tracker = TerritoryTracker()
@@ -83,10 +300,1004 @@ class SpectatorCore:
         
         # Active colors for 1v1
         self.active_colors = ['Blue', 'Red']
+
+        self.recent_visits = {}
         
         # Debug flags
         self.debug_mode = False
         self.last_minimap_mask = None
+
+    def _cleanup_recent_visits(self, current_time, retention_time=60.0):
+        """Remove old visits from tracking"""
+        self.recent_visits = [
+            visit for visit in self.recent_visits 
+            if current_time - visit['timestamp'] < retention_time
+        ]
+
+
+    def add_fallback_views(self, all_activities, current_time):
+        """Add balanced fallback views between players"""
+        # Track last fallback color
+        if not hasattr(self, 'last_fallback_color'):
+            self.last_fallback_color = None
+
+        # If we have no activities, add balanced fallback views
+        if not all_activities:
+            # Determine which color to start with
+            if self.last_fallback_color == 'Blue':
+                colors = ['Red', 'Blue']
+            else:
+                colors = ['Blue', 'Red']
+
+            for color in colors:
+                base_pos = self.base_monitor.get_tc_position(color)
+                if base_pos:
+                    all_activities.append({
+                        'position': base_pos,
+                        'importance': 0.1,  # Very low importance
+                        'type': 'fallback_view',
+                        'color': color,
+                        'timestamp': current_time
+                    })
+                    self.last_fallback_color = color
+                    break  # Only add one fallback view at a time
+
+
+    def decide_next_view(self, curr_minimap, mask, military_mode=False):
+        """
+        Enhanced view decision making with adjusted thresholds, player balance, and economic exploration
+        """
+        try:
+            all_activities = []
+            current_time = time.time()
+
+            # Clean up old visits
+            self._cleanup_recent_visits(current_time)
+
+            # Handle territory breaches (with increased importance)
+            breaches = self.check_territory_breaches(curr_minimap, mask)
+            for breach in breaches:
+                breach['importance'] *= 4.0  # Increased from 2.8
+                if breach.get('color'):  # Apply balance multiplier
+                    balance_multiplier = self.base_monitor.get_balance_multiplier(breach['color'])
+                    breach['importance'] *= balance_multiplier
+                all_activities.append(breach)
+                
+            # Get military activities
+            military_data = self.check_military_situation(curr_minimap, mask, military_mode=military_mode)
+            military_activities = military_data['activities']
+            
+            for activity in military_activities:
+                # Find closest enemy unit with reduced proximity threshold
+                enemy_units = [a for a in military_activities if a['color'] != activity['color']]
+                closest_enemy = min([self.calculate_distance(activity['position'], e['position']) 
+                                for e in enemy_units], default=1000)
+                
+                # Check proximity to enemy base
+                enemy_color = 'Red' if activity['color'] == 'Blue' else 'Blue'
+                enemy_base = self.base_monitor.get_tc_position(enemy_color)
+                if enemy_base:
+                    dist_to_enemy_base = self.calculate_distance(activity['position'], enemy_base)
+                    # Adjusted distance scaling for minimap
+                    activity['importance'] *= max(1.0, 2.5 - (dist_to_enemy_base / 50))
+                
+                # Combat detection with reduced distance for minimap
+                if closest_enemy < 20:  # Reduced from 35
+                    activity['type'] = 'major_combat'
+                    activity['importance'] *= 5.0  # Increased from 4.0
+                    activity['view_duration'] = self.combat_view_duration
+                
+                # Movement bonus with bigger difference
+                if activity.get('is_moving', False):
+                    activity['importance'] *= 2.5  # Increased from 1.5
+                
+                # Increased time factor for military balance
+                time_since_military = current_time - self.last_visit_times[activity['color']]['military']
+                if time_since_military > 20:  # Reduced from 30
+                    activity['importance'] *= 2.0  # Increased from 1.5
+
+                # Apply viewing time balance
+                if activity.get('color'):
+                    balance_multiplier = self.base_monitor.get_balance_multiplier(activity['color'])
+                    activity['importance'] *= balance_multiplier
+                
+                all_activities.append(activity)
+            
+
+
+            # Only add non-combat activities if no major combat
+            if not any(a.get('type') == 'major_combat' for a in all_activities):
+                if not military_mode:
+                    # Enhanced economic activities with exploration
+                    self.add_economic_activities(all_activities, curr_minimap, mask)
+
+                    # Traditional base checks with reduced importance
+                    bases = self.check_base_development()
+                    if bases:
+                        for base in bases:
+                            time_since_eco = current_time - self.last_visit_times[base['color']]['economy']
+                            base_boost = min(2.0, time_since_eco / 30.0)  # Reduced from 45.0
+                            base['importance'] = base['importance'] * 0.4 * base_boost  # Reduced from 0.7
+                            if base.get('color'):
+                                balance_multiplier = self.base_monitor.get_balance_multiplier(base['color'])
+                                base['importance'] *= balance_multiplier
+                            all_activities.append(base)
+                    
+                    # General activities with reduced importance
+                    general = self.detect_activity_zones(curr_minimap, mask)
+                    if general:
+                        for activity in general:
+                            activity['importance'] *= 0.3  # Reduced from 0.4
+                            if activity.get('color'):
+                                balance_multiplier = self.base_monitor.get_balance_multiplier(base['color'])
+                                activity['importance'] *= balance_multiplier
+                            all_activities.append(activity)
+
+                    # Add exploration points if we haven't checked bases in a while
+                    # More frequent exploration checks
+                    for color in ['Blue', 'Red']:
+                        time_since_eco = current_time - self.last_visit_times[color]['economy']
+                        if time_since_eco > 20:  # Reduced from 30
+                            explore_pos = self.get_base_exploration_point(color, mask)
+                            if explore_pos and not self._is_recently_visited(explore_pos):
+                                all_activities.append({
+                                    'position': explore_pos,
+                                    'importance': 0.4 * (time_since_eco / 30.0),  # Reduced from 45.0
+                                    'type': 'base_exploration',
+                                    'color': color,
+                                    'timestamp': current_time
+                                })
+
+            # Ensure we have at least one activity if everything else failed
+            if not all_activities:
+                # Add backup view between bases with very low importance
+                self.add_fallback_views(all_activities, current_time)
+
+            # Record the activity we're going to view
+            all_activities.sort(key=lambda x: x['importance'], reverse=True)
+            activities = self._deduplicate_activities(all_activities)
+            
+            if activities:
+                self.recent_visits.append({
+                    'position': activities[0]['position'],
+                    'timestamp': current_time
+                })
+                logging.info(f"Selected activity: {activities[0].get('type')} with importance {activities[0].get('importance', 0.0):.2f}")
+            else:
+                logging.warning("No activities found for next view")
+            
+            return activities
+            
+        except Exception as e:
+            logging.error(f"Error in decide_next_view: {e}")
+            return []
+    def handle_major_combat(self, position):
+        """Convert minimap position to screen coordinates and perform drag-follow only for army vs army"""
+        try:
+            # First click position and verify combat
+            self.click_minimap(position[0], position[1], self.current_mask)
+            time.sleep(0.4)  # Wait for camera to center
+            
+            # Verify both armies are present in combat
+            if not self.verify_active_combat(self.last_minimap, self.current_mask, position):
+                logging.info("No active combat detected, using regular view")
+                return
+                
+            screen_x = self.game_area_x + int((position[0] / self.minimap_width) * self.game_area_width)
+            screen_y = self.game_area_y + int((position[1] / self.minimap_height) * self.game_area_height)
+            
+            box_width = int(self.game_area_width * 0.5)
+            box_height = int(self.game_area_height * 0.5)
+            
+            start_x = max(self.game_area_x, screen_x - (box_width // 2))
+            start_y = max(self.game_area_y, screen_y - (box_height // 2))
+            end_x = min(self.game_area_x + self.game_area_width, start_x + box_width)
+            end_y = min(self.game_area_y + self.game_area_height, start_y + box_height)
+            
+            self.drag_and_follow(start_x, start_y, end_x, end_y)
+            self.forced_view_until = time.time() + 15.0  # 15 seconds minimum for major combat
+            logging.info(f"Initiated drag-follow for army vs army combat")
+                
+        except Exception as e:
+            logging.error(f"Error in handle_major_combat: {e}")
+
+
+    def drag_and_follow(
+        self, 
+        center_x,
+        center_y,
+        width_ratio=0.6,
+        height_ratio=0.35,
+        duration=1.0
+    ):
+        """
+        Perform a drag-and-follow, ensuring we stay away from each edge 
+        of our game area by a specified margin.
+        """
+
+        left_margin = 300
+        right_margin = 300
+        top_margin = 300
+        bottom_margin = 300
+
+        try:
+            box_width = int(self.game_area_width * width_ratio)
+            box_height = int(self.game_area_height * height_ratio)
+
+            # Compute the nominal top-left and bottom-right from center
+            start_x = center_x - box_width // 2
+            start_y = center_y - box_height // 2
+            end_x = start_x + box_width
+            end_y = start_y + box_height
+
+            # Define the safe bounding box within your game area
+            safe_min_x = self.game_area_x + left_margin
+            safe_max_x = (self.game_area_x + self.game_area_width) - right_margin
+            safe_min_y = self.game_area_y + top_margin
+            safe_max_y = (self.game_area_y + self.game_area_height) - bottom_margin
+
+            # Clamp all four sides
+            start_x = max(safe_min_x, min(safe_max_x, start_x))
+            end_x   = max(safe_min_x, min(safe_max_x, end_x))
+            start_y = max(safe_min_y, min(safe_max_y, start_y))
+            end_y   = max(safe_min_y, min(safe_max_y, end_y))
+
+            # If the box collapses, skip
+            if end_x <= start_x or end_y <= start_y:
+                logging.warning("Drag box is invalid/collapsed; skipping drag.")
+                return
+
+            # Move mouse to start
+            pyautogui.moveTo(start_x, start_y, duration=0.2)
+            time.sleep(0.05)
+
+            # Perform the drag
+            pyautogui.mouseDown(button='left')
+            pyautogui.moveTo(end_x, end_y, duration=duration)
+            pyautogui.mouseUp(button='left')
+
+            # Press 'f' to follow
+            time.sleep(0.3)
+            pyautogui.press('f')
+
+            logging.info(
+                f"Drag-follow from ({start_x}, {start_y}) to ({end_x}, {end_y}). "
+                f"Margins: L={left_margin}, R={right_margin}, T={top_margin}, B={bottom_margin}"
+            )
+
+        except Exception as e:
+            logging.error(f"Error in drag_and_follow: {e}")
+            pyautogui.mouseUp(button='left')
+
+
+    def verify_active_combat(self, minimap_image, mask, position):
+        """Verify both armies are actively present in the same area"""
+        try:
+            # Define search area around position
+            search_radius = 10  # Adjusted for minimap scale
+            x, y = position
+            
+            # Get densities for both armies in this area
+            blue_density = self.territory_tracker.get_color_density(
+                minimap_image, 'Blue', self.player_colors_config, mask
+            )
+            red_density = self.territory_tracker.get_color_density(
+                minimap_image, 'Red', self.player_colors_config, mask
+            )
+            
+            if blue_density is None or red_density is None:
+                return False
+                
+            # Define region of interest
+            y_start = max(0, y - search_radius)
+            y_end = min(blue_density.shape[0], y + search_radius)
+            x_start = max(0, x - search_radius)
+            x_end = min(blue_density.shape[1], x + search_radius)
+            
+            # Check if both armies have significant presence in this area
+            blue_presence = np.max(blue_density[y_start:y_end, x_start:x_end]) > 0.25
+            red_presence = np.max(red_density[y_start:y_end, x_start:x_end]) > 0.25
+            
+            return blue_presence and red_presence
+        except Exception as e:
+            logging.error(f"Error verifying combat: {e}")
+            return False
+
+
+    def check_territory_breaches(self, curr_minimap, mask):
+        """Check for units in enemy territory"""
+        breaches = []
+        
+        for color in ['Blue', 'Red']:
+            enemy_color = 'Red' if color == 'Blue' else 'Blue'
+            
+            # Get enemy territory
+            enemy_territory = self.territory_tracker.get_territory_mask(enemy_color)
+            if enemy_territory is None:
+                continue
+                
+            # Check for units in enemy territory
+            density = self.territory_tracker.get_color_density(
+                curr_minimap, color, self.player_colors_config, mask
+            )
+            
+            if density is not None:
+                # Find units in enemy territory
+                breaching_units = (density > self.territory_tracker.scout_detection_threshold) & (enemy_territory > 0.3)
+                
+                if np.any(breaching_units):
+                    # Find centroids of breaching groups
+                    contours, _ = cv2.findContours(breaching_units.astype(np.uint8), 
+                                                cv2.RETR_EXTERNAL, 
+                                                cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    for contour in contours:
+                        area = cv2.contourArea(contour)
+                        if area > 15:  # Even small groups are interesting if in enemy territory
+                            M = cv2.moments(contour)
+                            if M["m00"] != 0:
+                                cx = int(M["m10"] / M["m00"])
+                                cy = int(M["m01"] / M["m00"])
+                                
+                                breaches.append({
+                                    'position': (cx, cy),
+                                    'area': area,
+                                    'color': color,
+                                    'importance': min(1.0, area / 30.0) * 3.0,  # High importance for breaches
+                                    'type': 'territory_breach',
+                                    'timestamp': time.time()
+                                })
+        
+        return breaches
+    
+    def get_minimap_state(self):
+        """Capture all minimap-related state in one locked operation."""
+        try:
+            with self.minimap_lock:
+                curr_minimap = self.capture_minimap()
+                if curr_minimap is None:
+                    return None, None
+                    
+                mask = self.calculate_minimap_mask(curr_minimap)
+                if mask is None:
+                    return None, None
+                    
+                return curr_minimap, mask
+        except Exception as e:
+            logging.error(f"Error capturing minimap state: {e}")
+            return None, None
+
+
+
+    def get_base_exploration_point(self, color, mask=None):
+        """Get a point to explore around player's base with intelligent resource positioning"""
+        try:
+            base_pos = self.get_tc_position(color)
+            if not base_pos:
+                return None
+            
+            # Get territory density for this color to find active areas
+            density = self.territory_tracker.get_color_density(
+                self.last_minimap, color, self.player_colors_config, mask
+            )
+            
+            if density is not None:
+                # Look for activity clusters in base territory
+                y_start = max(0, base_pos[1] - 50)
+                y_end = min(density.shape[0], base_pos[1] + 50)
+                x_start = max(0, base_pos[0] - 50)
+                x_end = min(density.shape[1], base_pos[0] + 50)
+                
+                base_territory = density[y_start:y_end, x_start:x_end]
+                
+                # Find points of interest (areas with activity)
+                points = np.where(base_territory > 0.2)
+                if len(points[0]) > 0:
+                    # Randomly select from active points, favoring unexplored areas
+                    idx = random.randint(0, len(points[0]) - 1)
+                    explore_x = x_start + points[1][idx]
+                    explore_y = y_start + points[0][idx]
+                    
+                    # Check if point has been recently visited
+                    if not self._is_recently_visited((explore_x, explore_y)):
+                        return (explore_x, explore_y)
+            
+            # Fallback: use directional exploration
+            directions = [
+                (-30, -30),  # Back/left (likely woodlines)
+                (50, -30),   # Back/right (likely gold/stone)
+                (0, 50),     # Forward (likely expansion)
+                (-50, 0),    # Left (likely resources)
+                (50, 0),     # Right (likely resources)
+            ]
+            
+            # Try each direction until finding unvisited point
+            for x_offset, y_offset in directions:
+                point = (
+                    base_pos[0] + x_offset,
+                    base_pos[1] + y_offset
+                )
+                if not self._is_recently_visited(point) and self._is_valid_point(point, mask):
+                    return point
+                    
+            return base_pos  # Fallback to TC if no good points found
+            
+        except Exception as e:
+            logging.error(f"Error getting exploration point: {e}")
+            return base_pos
+
+
+    def is_likely_building_icon(self, contour, frame):
+        """Enhanced building detection using template matching"""
+        area = cv2.contourArea(contour)
+        
+        # Quick check for size range
+        if area < 15 or area > 25:  # Typical TC/Castle size range
+            return False
+            
+        # Check shape characteristics
+        perimeter = cv2.arcLength(contour, True)
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / hull_area if hull_area > 0 else 0
+        circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+        
+        # If basic shape checks pass, try template matching
+        if solidity > 0.95 and circularity > 0.8:
+            building_type = self.detect_building_type(contour, frame)
+            return building_type is not None
+            
+        return False
+
+    def add_economic_activities(self, all_activities, curr_minimap, mask):
+        """Add economic activities with focus on expansion and new activity"""
+        try:
+            for color in ['Blue', 'Red']:
+                # Get territory density to detect economic activity
+                density = self.territory_tracker.get_color_density(
+                    curr_minimap, color, self.player_colors_config, mask
+                )
+                
+                if density is not None:
+                    # Get main base position as reference
+                    base_pos = self.base_monitor.get_tc_position(color)
+                    if not base_pos:
+                        continue
+                    
+                    # Look for economic activity outside the main base area
+                    y_start = max(0, base_pos[1] - 100)
+                    y_end = min(density.shape[0], base_pos[1] + 100)
+                    x_start = max(0, base_pos[0] - 100)
+                    x_end = min(density.shape[1], base_pos[0] + 100)
+                    
+                    # First, check if we have previous density data to detect changes
+                    if hasattr(self, 'last_density_maps') and color in self.last_density_maps:
+                        prev_density = self.last_density_maps[color]
+                        if prev_density is not None and prev_density.shape == density.shape:
+                            # Look for new construction/activity
+                            diff = density - prev_density
+                            new_activity = np.where(diff > 0.2)  # Significant new activity
+                            for i in range(len(new_activity[0])):
+                                y, x = new_activity[0][i], new_activity[1][i]
+                                dist_from_base = self.calculate_distance((x, y), base_pos)
+                                if dist_from_base > 30:  # If significantly away from base
+                                    all_activities.append({
+                                        'position': (x, y),
+                                        'importance': 0.8,  # Higher importance for new activity
+                                        'type': 'economic_expansion',
+                                        'color': color,
+                                        'timestamp': time.time()
+                                    })
+                    
+                    # Store current density for next comparison
+                    if not hasattr(self, 'last_density_maps'):
+                        self.last_density_maps = {}
+                    self.last_density_maps[color] = density.copy()
+                    
+                    # Add exploration points for unexplored areas
+                    time_since_eco = time.time() - self.last_visit_times[color]['economy']
+                    if time_since_eco > 20:  # More frequent checks
+                        explore_pos = self.get_base_exploration_point(color, mask)
+                        if explore_pos and not self._is_recently_visited(explore_pos):
+                            dist_from_base = self.calculate_distance(explore_pos, base_pos)
+                            if dist_from_base > 30:  # Prioritize expansion areas
+                                all_activities.append({
+                                    'position': explore_pos,
+                                    'importance': 0.6,  # Moderate importance
+                                    'type': 'expansion_exploration',
+                                    'color': color,
+                                    'timestamp': time.time()
+                                })
+                        
+        except Exception as e:
+            logging.error(f"Error adding economic activities: {e}")
+
+    def _is_recently_visited(self, position, threshold=30.0):
+        """Check if a position has been visited recently"""
+        current_time = time.time()
+        return any(
+            self.calculate_distance(position, visit['position']) < 30 and
+            current_time - visit['timestamp'] < threshold
+            for visit in self.recent_visits
+        )
+
+    def _is_valid_point(self, point, mask):
+        """Check if a point is within valid minimap bounds"""
+        if mask is None:
+            return True
+        x, y = point
+        return (0 <= x < mask.shape[1] and 
+                0 <= y < mask.shape[0] and 
+                mask[y, x] > 0)
+
+
+
+
+
+
+
+    def calculate_military_importance(self, position, color, area, is_moving):
+        """Enhanced military importance calculation that heavily favors units away from their home base"""
+        # Get home base position
+        own_base = self.base_monitor.get_tc_position(color)
+        if not own_base:
+            return min(1.0, area / 15.0)  # Fallback to simple area-based importance
+            
+        # Calculate distance from own base
+        dist_from_home = self.calculate_distance(position, own_base)
+        
+        # Calculate base importance from unit size
+        base_importance = min(1.0, area / 20.0)  # Adjusted for minimap scale
+        
+        # Heavy bonus for being away from home base
+        # Start scaling up at 50 pixels, max bonus at 150 pixels
+        distance_multiplier = min(4.0, max(1.0, dist_from_home / 25))
+        
+        # Movement is very important
+        movement_multiplier = 3.0 if is_moving else 0.2
+        
+        # Check if in enemy territory
+        enemy_color = 'Red' if color == 'Blue' else 'Blue'
+        enemy_density = self.territory_tracker.get_color_density(enemy_color)
+        territory_multiplier = 1.0
+        
+        if enemy_density is not None:
+            x, y = position
+            if x < enemy_density.shape[1] and y < enemy_density.shape[0]:
+                territory_control = enemy_density[y, x]
+                if territory_control > 0.5:  # Deep in enemy territory
+                    territory_multiplier = 4.0  # Major boost for being in enemy territory
+                elif territory_control > 0.2:  # Near enemy territory
+                    territory_multiplier = 2.5
+        
+        # Static position penalty for large areas (likely buildings)
+        if area > 15 and not is_moving:  # TC/Castle sized
+            importance = base_importance * 0.1  # Heavy penalty for static large objects
+        else:
+            # Combine all factors with adjusted weights
+            importance = (base_importance * 
+                        distance_multiplier * 
+                        movement_multiplier * 
+                        territory_multiplier)
+        
+        logging.debug(f"Military importance calculation: base={base_importance:.2f}, " 
+                    f"dist_mult={distance_multiplier:.2f}, move_mult={movement_multiplier:.2f}, "
+                    f"terr_mult={territory_multiplier:.2f}, final={importance:.2f}")
+        
+        return importance
+
+
+    def detect_building_type(self, contour, frame):
+        """
+        Determine if a contour matches TC or Castle template
+        Returns: None, 'tc', or 'castle'
+        """
+        try:
+            # Get contour region
+            x, y, w, h = cv2.boundingRect(contour)
+            roi = frame[y:y+h, x:x+w]
+            
+            # Convert ROI to grayscale
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            # Load and resize templates to match ROI size
+            tc_template = cv2.imread('templates/town_center.png', cv2.IMREAD_GRAYSCALE)
+            castle_template = cv2.imread('templates/castle.png', cv2.IMREAD_GRAYSCALE)
+            
+            if tc_template is not None and castle_template is not None:
+                tc_template = cv2.resize(tc_template, (w, h))
+                castle_template = cv2.resize(castle_template, (w, h))
+                
+                # Template matching
+                tc_match = cv2.matchTemplate(gray_roi, tc_template, cv2.TM_CCOEFF_NORMED)
+                castle_match = cv2.matchTemplate(gray_roi, castle_template, cv2.TM_CCOEFF_NORMED)
+                
+                tc_val = cv2.minMaxLoc(tc_match)[1]
+                castle_val = cv2.minMaxLoc(castle_match)[1]
+                
+                # Threshold for matching
+                if tc_val > 0.8:
+                    return 'tc'
+                elif castle_val > 0.8:
+                    return 'castle'
+                    
+            return None
+        except Exception as e:
+            logging.error(f"Error in building detection: {e}")
+            return None
+
+
+
+    def find_all_buildings(self, military_map):
+        """Find all building positions using template matching"""
+        # Convert to grayscale
+        gray = cv2.cvtColor(military_map, cv2.COLOR_BGR2GRAY)
+        building_positions = []
+        
+        for template_path in ['templates/town_center.png', 'templates/castle.png']:
+            try:
+                template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+                if template is not None:
+                    # Use template matching
+                    res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+                    threshold = 0.8
+                    locations = np.where(res >= threshold)
+                    for pt in zip(*locations[::-1]):  # Switch columns and rows
+                        building_positions.append((pt[0], pt[1]))
+            except Exception as e:
+                logging.error(f"Error loading template {template_path}: {e}")
+                
+        return building_positions
+
+    def is_near_building(self, position, building_positions, threshold=15):
+        """Check if a position is near any known building"""
+        x, y = position
+        for bx, by in building_positions:
+            if abs(x - bx) < threshold and abs(y - by) < threshold:
+                return True
+        return False
+
+
+    def check_military_situation(self, curr_minimap, mask, military_mode=False):
+        """
+        Comprehensive military situation detector with enhanced field unit detection.
+        """
+        try:
+            military_activities = []
+            military_data = {
+                'activities': [],
+                'high_density': False,
+                'military_map': None
+            }
+            
+            # Get military map with caching
+            current_time = time.time()
+            if not military_mode:
+                if hasattr(self, '_cached_military_map') and \
+                    current_time - self._last_military_cache < 5.0:  # 5-second cache
+                    military_map = self._cached_military_map
+                else:
+                    with self.minimap_lock:
+                        self.toggle_military_view()
+                        time.sleep(0.2)
+                        military_map = self.capture_minimap()
+                        if military_map is None:
+                            raise Exception("Failed to capture military map")
+                        self._cached_military_map = military_map
+                        self._last_military_cache = current_time
+                        # Return to normal view
+                        self.toggle_military_view()
+                        self.toggle_military_view()
+            else:
+                military_map = curr_minimap
+
+            military_data['military_map'] = military_map
+            
+            # Store positions for proximity checks
+            player_positions = {'Blue': [], 'Red': []}
+            
+            # First identify buildings using template matching
+            building_positions = []
+            gray_map = cv2.cvtColor(military_map, cv2.COLOR_BGR2GRAY)
+            for template_path in ['templates/town_center.png', 'templates/castle.png']:
+                try:
+                    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+                    if template is not None:
+                        res = cv2.matchTemplate(gray_map, template, cv2.TM_CCOEFF_NORMED)
+                        threshold = 0.8
+                        locations = np.where(res >= threshold)
+                        for pt in zip(*locations[::-1]):
+                            building_positions.append((pt[0], pt[1]))
+                except Exception as e:
+                    logging.error(f"Error loading template {template_path}: {e}")
+            
+            # Detect buildings under attack
+            attack_positions = self.detect_building_under_attack(military_map)
+            
+            # Adjusted thresholds for minimap scale
+            is_early_game = not any(self.territory_tracker.castle_age_reached.values())
+            
+            for color in ['Blue', 'Red']:
+                # Get player's base position
+                own_base = self.base_monitor.get_tc_position(color)
+                
+                density = self.territory_tracker.get_color_density(
+                    military_map, color, self.player_colors_config, mask
+                )
+                
+                if density is not None:
+                    # Check overall military density
+                    total_military_presence = np.sum(density > 0.15)  # More sensitive
+                    military_data['high_density'] = total_military_presence > 50
+                    
+                    # Find potential military units
+                    significant = (density > 0.12).astype(np.uint8)  # Lower threshold
+                    contours, _ = cv2.findContours(significant, cv2.RETR_EXTERNAL, 
+                                                cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    for contour in contours:
+                        area = cv2.contourArea(contour)
+                        if area < 3:  # Only filter extreme noise
+                            continue
+                        
+                        M = cv2.moments(contour)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            
+                            # Skip if near known building
+                            is_near_building = False
+                            for bx, by in building_positions:
+                                if abs(cx - bx) < 15 and abs(cy - by) < 15:
+                                    is_near_building = True
+                                    break
+                            if is_near_building:
+                                continue
+                            
+                            # Check for movement
+                            is_moving = False
+                            movement_score = 0
+                            if hasattr(self, 'last_military_map') and self.last_military_map is not None:
+                                prev_region = cv2.getRectSubPix(
+                                    self.last_military_map, 
+                                    (7, 7),  # Smaller window for movement detection
+                                    (cx, cy)
+                                )
+                                curr_region = cv2.getRectSubPix(
+                                    military_map,
+                                    (7, 7),
+                                    (cx, cy)
+                                )
+                                movement_score = np.mean(cv2.absdiff(prev_region, curr_region))
+                                is_moving = movement_score > 0.08
+                            
+                            # Initialize importance and distance
+                            importance = 0.5  # Base importance for military units
+                            dist_from_home = 1000  # Default to large distance
+                            
+                            # Distance from own base is critical
+                            if own_base:
+                                dist_from_home = self.calculate_distance((cx, cy), own_base)
+                                if dist_from_home > 30:  # Significantly away from base
+                                    importance *= 3.0
+                                    if is_moving:
+                                        importance *= 2.0
+                                elif dist_from_home > 20:  # Moderately away
+                                    importance *= 2.0
+                            
+                            # Check if in enemy territory using color density
+                            enemy_color = 'Red' if color == 'Blue' else 'Blue'
+                            enemy_density = self.territory_tracker.get_color_density(
+                                military_map, enemy_color, self.player_colors_config, mask
+                            )
+                            if enemy_density is not None and cy < enemy_density.shape[0] and cx < enemy_density.shape[1]:
+                                if enemy_density[cy, cx] > 0.3:  # In enemy territory
+                                    importance *= 3.0
+                                    if is_moving:
+                                        importance *= 1.5
+                            
+                            # Early game bonus
+                            if is_early_game:
+                                importance *= 1.5
+                            
+                            # Store position and add activity
+                            player_positions[color].append((cx, cy))
+                            
+                            # Determine type based on distance (now always defined)
+                            activity_type = 'field_military' if dist_from_home > 20 else 'military_units'
+                            
+                            military_activities.append({
+                                'position': (cx, cy),
+                                'area': area,
+                                'color': color,
+                                'importance': importance,
+                                'type': activity_type,
+                                'is_moving': is_moving,
+                                'movement_score': movement_score,
+                                'high_density': military_data['high_density'],
+                                'timestamp': current_time
+                            })
+
+            # Store current military map for next comparison
+            self.last_military_map = military_map.copy()
+
+            # Check for combat
+            for activity in military_activities:
+                enemy_color = 'Red' if activity['color'] == 'Blue' else 'Blue'
+                pos = activity['position']
+                
+                for enemy_pos in player_positions[enemy_color]:
+                    dist = self.calculate_distance(pos, enemy_pos)
+                    if dist < 25:  # Combat detection radius
+                        activity['type'] = 'major_combat'
+                        activity['importance'] *= 4.0
+                        activity['view_duration'] = self.combat_view_duration
+                        break
+            
+            military_data['activities'] = self._deduplicate_activities(
+                military_activities, proximity_threshold=12  # Smaller radius
+            )
+            return military_data
+            
+        except Exception as e:
+            logging.error(f"Error in check_military_situation: {e}")
+            return {'activities': [], 'high_density': False, 'military_map': None}
+
+
+
+    def _deduplicate_activities(self, military_activities, proximity_threshold=12):
+        """Enhanced deduplication that preserves more distinct military movements"""
+        if not military_activities:
+            return []
+            
+        # First sort by importance
+        military_activities.sort(key=lambda x: x['importance'], reverse=True)
+        
+        # Keep track of positions per player
+        player_positions = {'Blue': [], 'Red': []}
+        unique_activities = []
+        
+        for activity in military_activities:
+            pos = activity['position']
+            color = activity['color']
+            
+            # Check distance from same player's activities
+            is_unique = True
+            for prev_pos in player_positions[color]:
+                if self.calculate_distance(pos, prev_pos) < proximity_threshold:
+                    is_unique = False
+                    break
+            
+            if is_unique:
+                unique_activities.append(activity)
+                player_positions[color].append(pos)
+                
+                # Make sure we don't queue too many activities
+                if len(player_positions[color]) >= 3:  # Keep up to 3 activities per player
+                    continue
+        
+        return unique_activities
+
+
+    def determine_closest_base(self, position):
+        """Determine which player's base is closest to the given position"""
+        closest_color = None
+        min_distance = float('inf')
+        
+        for color in self.active_colors:
+            base_pos = self.base_monitor.get_tc_position(color)
+            if base_pos:
+                distance = self.calculate_distance(position, base_pos)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_color = color
+        
+        return closest_color
+
+
+    def detect_building_under_attack(self, military_map):
+        """
+        Detect white flashing of buildings under attack in military view.
+        Returns list of positions where buildings are being attacked.
+        """
+        try:
+            # Convert to HSV to detect white flashing
+            hsv = cv2.cvtColor(military_map, cv2.COLOR_BGR2HSV)
+            
+            # White has very low saturation and high value
+            white_mask = cv2.inRange(hsv, 
+                np.array([0, 0, 200], dtype=np.uint8),  # Very low saturation, high value
+                np.array([180, 30, 255], dtype=np.uint8)
+            )
+            
+            # Find white flashing areas
+            contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            attack_positions = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                # Buildings have a specific size range when flashing
+                if 150 < area < 300:  # Adjust these thresholds as needed
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        attack_positions.append((cx, cy))
+            
+            return attack_positions
+        except Exception as e:
+            logging.error(f"Error detecting building attacks: {e}")
+            return []
+
+    def detect_large_military_presence(self, minimap_image, minimap_mask):
+        """
+        Detect large concentrations of military units using the military-only view.
+        Returns positions and sizes of significant military gatherings.
+        """
+        try:
+            results = []
+            
+            with self.minimap_lock:
+                # Switch to military view
+                self.toggle_military_view()
+                time.sleep(0.2)
+                
+                military_map = self.capture_minimap()
+                if military_map is None:
+                    self.toggle_military_view()  # First toggle back
+                    self.toggle_military_view()  # Second toggle back
+                    return []
+                    
+                for color in ['Blue', 'Red']:
+                    density = self.territory_tracker.get_color_density(
+                        military_map, 
+                        color, 
+                        self.player_colors_config, 
+                        minimap_mask
+                    )
+                    
+                    if density is not None:
+                        significant = (density > 0.25).astype(np.uint8)
+                        contours, _ = cv2.findContours(
+                            significant, 
+                            cv2.RETR_EXTERNAL, 
+                            cv2.CHAIN_APPROX_SIMPLE
+                        )
+                        
+                        for contour in contours:
+                            area = cv2.contourArea(contour)
+                            if area > 100:  # Adjust this threshold based on your screenshot
+                                M = cv2.moments(contour)
+                                if M["m00"] != 0:
+                                    cx = int(M["m10"] / M["m00"])
+                                    cy = int(M["m01"] / M["m00"])
+                                    
+                                    importance = min(1.0, area / 200)
+                                    
+                                    results.append({
+                                        'position': (cx, cy),
+                                        'area': area,
+                                        'color': color,
+                                        'importance': importance,
+                                        'type': 'military_mass'
+                                    })
+                
+                # Return to normal view
+                self.toggle_military_view()  # First toggle back
+                self.toggle_military_view()  # Second toggle back
+                
+            return sorted(results, key=lambda x: x['importance'], reverse=True)
+            
+        except Exception as e:
+            logging.error(f"Error detecting military presence: {e}")
+            # Make sure we toggle back even if there's an error
+            try:
+                with self.minimap_lock:
+                    self.toggle_military_view()  # First toggle back
+                    self.toggle_military_view()  # Second toggle back
+            except:
+                pass
+            return []
 
     def run_spectator(self):
         """Main spectator loop."""
@@ -105,115 +1316,202 @@ class SpectatorCore:
     def run_spectator_iteration(self):
         """Run a single iteration of the spectator logic."""
         try:
-            # Check for game over first
             if self.detect_game_over():
                 logging.info("Game has ended, stopping spectator")
-                return False  # Signal to stop spectating
+                return False
 
-            curr_time = time.time()
-            curr_minimap = self.capture_minimap()
-            if curr_minimap is None:
+            current_time = time.time()
+            curr_minimap, mask = self.get_minimap_state()
+            if curr_minimap is None or mask is None:
                 return True
 
-            # Calculate mask once for this iteration
-            mask = self.calculate_minimap_mask(curr_minimap)
-            if mask is None:
-                logging.error("Failed to generate minimap mask")
-                return True
-
-            # Initialize view tracking if not exists
+            self.current_mask = mask
+            self.last_minimap = curr_minimap
+            
+            # Initialize view tracking if needed
             if not hasattr(self, 'current_view_position'):
                 self.current_view_position = None
                 self.time_at_position = 0
                 self.max_view_time = 10.0
                 self.last_positions = []
                 self.forced_view_until = 0
+                self.combat_perspective = 'defender'
+                self.last_perspective_switch = 0
+                self.perspective_switch_interval = 8.0
+                self.last_military_view = 0
+                self.last_switch_time = current_time  # Add explicit initialization
 
-            # Update territory tracker with mask
+            # Get comprehensive military situation once per iteration
+            military_data = self.check_military_situation(curr_minimap, mask, military_mode=False)
+            military_activities = military_data['activities']
+            high_density = military_data['high_density']
+                
+            # Handle high density military situations first
+            if high_density and current_time - self.last_military_view > 15.0:
+                large_military = [act for act in military_activities if act['area'] > 100]
+                if large_military:
+                    # First check if there are any opposing forces nearby
+                    potential_conflicts = []
+                    for act in large_military:
+                        enemy_color = 'Red' if act['color'] == 'Blue' else 'Blue'
+                        enemy_activities = [a for a in military_activities if a['color'] == enemy_color]
+                        
+                        # Check for any nearby enemy units
+                        for enemy_act in enemy_activities:
+                            dist = self.calculate_distance(act['position'], enemy_act['position'])
+                            if dist < 50:  # 50 pixel radius for potential conflict
+                                act['has_enemy_nearby'] = True
+                                potential_conflicts.append(act)
+                                break
+
+                    if potential_conflicts:  # Only force view if there's potential conflict
+                        # Sort by importance to pick the most significant conflict
+                        act = max(potential_conflicts, key=lambda x: x['importance'])
+                        if act.get('type') == 'major_combat':
+                            self.handle_major_combat(act['position'])
+                        else:
+                            self.click_minimap(act['position'][0], act['position'][1], mask)
+                        self.last_military_view = current_time
+                        self.last_switch_time = current_time
+                        logging.info(f"Forced military check due to high density situation with nearby opposition")
+                        return True
+
+            # Add base checks to viewing queue instead of forcing them
+            if current_time - self.last_military_view > 5.0:
+                for color in ['Blue', 'Red']:
+                    if self.base_monitor.should_check_base(color, current_time):
+                        base_pos = self.base_monitor.get_tc_position(color)
+                        if base_pos:
+                            self.viewing_queue.add_zone({
+                                'position': base_pos,
+                                'importance': 0.8,
+                                'type': 'base_check',
+                                'color': color,
+                                'timestamp': current_time
+                            })
+                            logging.info(f"Added base check for {color} to viewing queue")
+
+            # Update territory understanding
             self.territory_tracker.update(curr_minimap, self.player_colors_config, 
-                                    self.active_colors, mask)
-            
-            current_view_duration = random.uniform(self.min_view_duration, self.max_view_duration)
+                                        self.active_colors, mask)
 
-            # Check if we're in a forced temporary view
-            if curr_time < self.forced_view_until:
+            # Handle view duration
+            current_activity = self.viewing_queue.get_current_view()
+            if current_activity and current_activity.get('type') == 'combat_zone':
+                current_view_duration = self.combat_view_duration
+            else:
+                current_view_duration = random.uniform(self.min_view_duration, self.max_view_duration)
+
+            if current_time < self.forced_view_until:
                 return True
 
-            # Check if we've been looking at the same area too long
-            if self.current_view_position:
-                time_spent = curr_time - self.time_at_position
-                if time_spent > self.max_view_time:
-                    # Force a temporary view change
-                    temp_zones = self.detect_activity_zones(curr_minimap, mask)
-                    if temp_zones:
-                        # Filter out recent positions
-                        new_zones = [z for z in temp_zones if all(
-                            self.calculate_distance(z['position'], p) > 50 
-                            for p in self.last_positions
-                        )]
-                        if new_zones:
-                            zone = random.choice(new_zones[:3])
-                            self.click_minimap(*zone['position'], mask)
-                            self.last_switch_time = curr_time
-                            self.forced_view_until = curr_time + 2.0
-                            self._update_view_position(zone['position'], curr_time)
-                            logging.info(f"Forced temporary view change (area: {zone['area']:.1f})")
-                            return True
+            # Determine if view switch is needed
+            should_switch = False
+            time_since_last_switch = current_time - self.last_switch_time
 
-            # Normal view switching logic
-            if curr_time - self.last_switch_time >= current_view_duration:
-                # Priority 1: Check for high-importance raids
-                raids = self.territory_tracker.detect_raids(curr_minimap, self.player_colors_config, mask)
-                if raids:
-                    raids.sort(key=lambda x: x['importance'], reverse=True)
-                    top_raid = raids[0]
+            # Force a switch if we've been in one place too long
+            if time_since_last_switch >= max(self.max_view_time, current_view_duration + 2.0):
+                should_switch = True
+                logging.info("Forcing view switch due to timeout")
+            elif self.current_view_position:
+                time_spent = current_time - self.time_at_position
+                pos_key = f"{self.current_view_position[0]},{self.current_view_position[1]}"
+                view_count = self.viewing_queue.view_counts.get(pos_key, 0)
+                
+                if (time_spent > self.max_view_time or 
+                    (view_count > self.viewing_queue.staleness_threshold and 
+                    not current_activity.get('is_moving', False))):
+                    should_switch = True
+
+            # Handle view switching
+            if should_switch or (time_since_last_switch >= current_view_duration):
+                # Use the already collected military data
+                activities = self.decide_next_view(military_data['military_map'], mask, military_mode=True)
+                
+                if activities:
+                    next_activity = activities[0]
+                    pos = next_activity['position']
                     
-                    if top_raid['importance'] > 0.8:
-                        if self.handle_raid(top_raid, mask):
-                            self._update_view_position(top_raid['position'], curr_time)
-                            return True
-                    elif top_raid['importance'] > 0.6 and random.random() > 0.3:
-                        if self.handle_raid(top_raid, mask):
-                            self._update_view_position(top_raid['position'], curr_time)
-                            return True
-                    elif random.random() > 0.7:
-                        if self.handle_raid(top_raid, mask):
-                            self._update_view_position(top_raid['position'], curr_time)
-                            return True
+                    if self.is_point_in_minimap(pos[0], pos[1], mask):
+                        # Handle different activity types
+                        if next_activity.get('type') == 'major_combat':
+                            # Verify combat before doing drag-follow
+                            if self.verify_active_combat(curr_minimap, mask, pos):
+                                self.handle_major_combat(pos)
+                            else:
+                                self.click_minimap(pos[0], pos[1], mask)
+                        elif next_activity.get('type') in ['base_exploration', 'eco_activity']:
+                            self.click_minimap(pos[0], pos[1], mask)
+                            logging.info(f"Exploring {next_activity.get('type')} for {next_activity.get('color', 'unknown')}")
+                        elif next_activity.get('type') == 'combat_zone':
+                            if self.combat_perspective == 'defender':
+                                defender_base = self.base_monitor.get_tc_position(next_activity.get('defender'))
+                                if defender_base:
+                                    pos = self._adjust_combat_position(pos, defender_base, 8)
+                            self.click_minimap(pos[0], pos[1], mask)
+                        elif next_activity.get('type') == 'territory_breach':
+                            # Enhanced handling for territory breaches
+                            enemy_color = 'Red' if next_activity['color'] == 'Blue' else 'Blue'
+                            enemy_base = self.base_monitor.get_tc_position(enemy_color)
+                            if enemy_base:
+                                # Adjust view position to better show the breach context
+                                pos = self._adjust_combat_position(pos, enemy_base, 12)
+                            self.click_minimap(pos[0], pos[1], mask)
+                        else:
+                            self.click_minimap(pos[0], pos[1], mask)
+                        
+                        self.last_switch_time = current_time
+                        self._update_view_position(pos, current_time)
+                        
+                        logging.info(f"Switched to {next_activity.get('color', 'unknown')} "
+                                f"{next_activity.get('type', 'activity')} "
+                                f"(area: {next_activity.get('area', 0):.1f}, "
+                                f"importance: {next_activity.get('importance', 1.0):.1f}, "
+                                f"moving: {next_activity.get('is_moving', False)})")
 
-                # Priority 2: Normal activity with enhanced variety
-                new_zones = self.detect_activity_zones(curr_minimap, mask)
-                if new_zones:
-                    importance_threshold = random.uniform(0.3, 0.7)
-                    valid_zones = [
-                        zone for zone in new_zones 
-                        if zone['importance'] > importance_threshold and
-                        self.is_point_in_minimap(zone['position'][0], zone['position'][1], mask)
-                    ]
-                    
-                    if valid_zones:
-                        top_zones = valid_zones[:5]
-                        selected_zone = random.choice(top_zones)
-                        self.viewing_queue.add_zone(selected_zone)
+            # Handle combat perspective switching with proper view updates
+            if current_time - self.last_perspective_switch >= self.perspective_switch_interval:
+                old_perspective = self.combat_perspective
+                self.combat_perspective = 'attacker' if self.combat_perspective == 'defender' else 'defender'
+                self.last_perspective_switch = current_time
+                logging.info(f"Switched combat perspective to {self.combat_perspective}")
+                
+                # Force a view update if we're watching combat
+                current_activity = self.viewing_queue.get_current_view()
+                if (current_activity and 
+                    current_activity.get('type') in ['major_combat', 'combat_zone', 'territory_breach']):
+                    activities = self.decide_next_view(curr_minimap, mask, military_mode=True)
+                    if activities and activities[0].get('type') in ['major_combat', 'combat_zone', 'territory_breach']:
+                        base_color = activities[0].get('defender' if self.combat_perspective == 'defender' else 'color')
+                        base_pos = self.base_monitor.get_tc_position(base_color) if base_color else None
+                        pos = activities[0]['position']
+                        if base_pos:
+                            pos = self._adjust_combat_position(pos, base_pos, 12)
+                        self.click_minimap(pos[0], pos[1], mask)
+                        logging.info(f"Updated combat view for new {self.combat_perspective} perspective")
 
-                next_view = self.viewing_queue.get_next_view()
-                if next_view:
-                    x, y = next_view['position']
-                    if self.is_point_in_minimap(x, y, mask):
-                        self.click_minimap(x, y, mask)
-                        self.last_switch_time = curr_time
-                        self._update_view_position((x, y), curr_time)
-                        logging.info(f"Switched to {next_view['color']} activity "
-                                f"(area: {next_view['area']:.1f}, "
-                                f"importance: {next_view.get('importance', 1.0):.1f})")
-
-            return True  # Continue spectating
+            return True
 
         except Exception as e:
             logging.error(f"Error in spectator iteration: {e}")
             import traceback
             logging.error(traceback.format_exc())
-            return True  # Continue despite error
+            return True
+        
+        
+    def _adjust_combat_position(self, pos, base_pos, offset):
+        """Adjust viewing position for combat based on defender's base position."""
+        dx = base_pos[0] - pos[0]
+        dy = base_pos[1] - pos[1]
+        distance = np.sqrt(dx*dx + dy*dy)
+        
+        if distance > 0:
+            return (
+                int(pos[0] + (dx/distance) * offset),
+                int(pos[1] + (dy/distance) * offset)
+            )
+        return pos
+
 
 
     def capture_minimap(self):
@@ -234,6 +1532,60 @@ class SpectatorCore:
         except Exception as e:
             logging.error(f"Error capturing minimap: {e}")
             return None
+
+    def toggle_military_view(self):
+        """Toggle the military-only view state"""
+        pyautogui.hotkey('alt', 'm')
+        time.sleep(0.1)  # Small delay to ensure view changes
+
+    def detect_military_activity(self):
+        """Detect military activity with enhanced proximity scoring"""
+        try:
+            self.minimap_lock.acquire()
+            
+            # Switch to military view
+            self.toggle_military_view()
+            time.sleep(0.2)
+            
+            military_map = self.capture_minimap()
+            if military_map is not None:
+                # Get separate activity zones for each player
+                blue_military = self.detect_activity_zones(military_map, self.current_mask, specific_color='Blue')
+                red_military = self.detect_activity_zones(military_map, self.current_mask, specific_color='Red')
+                
+                combined_zones = []
+                proximity_radius = 40  # Radius to check for nearby enemy units
+                
+                # Check each blue zone for nearby red zones and vice versa
+                for blue_zone in blue_military:
+                    nearby_red = [red for red in red_military if 
+                                self.calculate_distance(blue_zone['position'], red['position']) < proximity_radius]
+                    if nearby_red:
+                        # Boost importance based on proximity
+                        blue_zone['importance'] *= 1.4  # Higher boost for military convergence
+                        blue_zone['type'] = 'military_convergence'
+                        combined_zones.append(blue_zone)
+                    else:
+                        combined_zones.append(blue_zone)
+                
+                # Add remaining red zones
+                for red_zone in red_military:
+                    if not any(self.calculate_distance(red_zone['position'], z['position']) < proximity_radius 
+                            for z in combined_zones):
+                        combined_zones.append(red_zone)
+                
+                military_activity = sorted(combined_zones, key=lambda x: x['importance'], reverse=True)
+            else:
+                military_activity = []
+                
+            # Return to normal view (two toggles needed)
+            self.toggle_military_view()
+            self.toggle_military_view()
+            time.sleep(0.2)
+            
+            return military_activity
+        finally:
+            self.minimap_lock.release()
 
 
     def detect_game_over(self):
@@ -340,12 +1692,15 @@ class SpectatorCore:
             logging.error(f"Error in game over detection: {e}")
             return False
     
-    def detect_activity_zones(self, minimap_image, minimap_mask):
+    def detect_activity_zones(self, minimap_image, minimap_mask, specific_color=None):
         """Detect activity zones with mask support."""
         activity_zones = []
         hsv_image = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
 
-        for color in self.active_colors:
+        # If specific_color is provided, only check that color
+        colors_to_check = [specific_color] if specific_color else self.active_colors
+
+        for color in colors_to_check:
             ranges = self.player_colors_config[color]
             
             normal_mask = cv2.inRange(hsv_image, 
@@ -359,7 +1714,7 @@ class SpectatorCore:
             color_mask = cv2.morphologyEx(normal_mask, cv2.MORPH_OPEN, kernel)
             
             contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, 
-                                         cv2.CHAIN_APPROX_SIMPLE)
+                                        cv2.CHAIN_APPROX_SIMPLE)
             
             for contour in contours:
                 area = cv2.contourArea(contour)
@@ -378,12 +1733,6 @@ class SpectatorCore:
                                 'importance': importance,
                                 'timestamp': time.time()
                             })
-
-            if self.debug_mode:
-                debug_img = minimap_image.copy()
-                debug_img[minimap_mask == 0] = [128, 128, 128]
-                cv2.drawContours(debug_img, contours, -1, (0, 255, 0), 2)
-                cv2.imwrite(f'debug_activity_{color}.png', debug_img)
 
         return sorted(activity_zones, key=lambda x: x['importance'], reverse=True)
 
@@ -433,12 +1782,43 @@ class SpectatorCore:
         return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
 
     def _update_view_position(self, position, time):
-        """Helper method to update view position tracking."""
         self.current_view_position = position
         self.time_at_position = time
         self.last_positions.append(position)
         if len(self.last_positions) > 5:
             self.last_positions.pop(0)
+            
+        # Reset view counts for areas we've moved away from
+        self.viewing_queue.reset_view_count(position)
+        
+        # Update visit tracking
+        current_view = self.viewing_queue.get_current_view()
+        if current_view:
+            activity_type = 'military' if current_view['type'] in ['military_units', 'combat_zone'] else 'economy'
+            self.last_visit_times[current_view['color']][activity_type] = time
+
+
+    def _get_military_map(self):
+        """Get military map with caching"""
+        current_time = time.time()
+        
+        if hasattr(self, '_cached_military_map'):
+            if current_time - self._last_military_cache < 5.0:  # Cache valid for 5 seconds
+                return self._cached_military_map
+        
+        with self.minimap_lock:
+            self.toggle_military_view()
+            time.sleep(0.2)
+            military_map = self.capture_minimap()
+            self.toggle_military_view()
+            self.toggle_military_view()
+            
+            if military_map is not None:
+                self._cached_military_map = military_map
+                self._last_military_cache = current_time
+                
+            return military_map
+
 
     def click_minimap(self, x, y, mask):
         """Click a position on the minimap if it's within bounds."""
@@ -461,8 +1841,8 @@ class SpectatorCore:
             mask = np.zeros((height, width), dtype=np.uint8)
 
             # Fine-tuning parameters
-            vertical_shift = int(height * 0.03)
-            top_adjustment = 8
+            vertical_shift = int(height * 0.05)
+            top_adjustment = 9
             side_expansion = 14
             bottom_alignment = int(height * 0.88)
 
@@ -516,17 +1896,17 @@ class TerritoryTracker:
         self.last_update = 0
         self.update_interval = 1.0  # Reduced for more frequent updates
         self.last_density_map = None
-        self.prev_frame = None
+        self.prev_frame = {}
         
         # Detection thresholds
-        self.RAID_THRESHOLD = 0.4
-        self.scout_detection_threshold = 0.08
+        self.RAID_THRESHOLD = 0.3
+        self.scout_detection_threshold = 0.05
         self.early_game_multiplier = 1.8
-        self.base_detection_threshold = 0.25
+        self.base_detection_threshold = 0.20
         
         # Parameters for clustering
-        self.cluster_distance = 30
-        self.detection_radius = 60
+        self.cluster_distance = 25
+        self.detection_radius = 30
         
         # Raid tracking
         self.raid_history = {}
@@ -537,6 +1917,11 @@ class TerritoryTracker:
         # Movement detection weights
         self.movement_weight = 0.4
         self.static_weight = 0.6
+
+        self.castle_age_reached = {
+            'Blue': False,
+            'Red': False
+        }
 
     def initialize_player(self, color):
         """Initialize tracking for a new player color."""
@@ -676,117 +2061,184 @@ class TerritoryTracker:
             return {'position': (x, y), 'density': max_val}
         return None
 
-    def detect_raids(self, minimap_image, hsv_ranges, minimap_mask=None):
-        """Detect raids with dynamic radius based on territory control and field battles."""
-        raids = []
-        current_time = time.time()
-        
-        for attacker in self.territories:
-            for defender in self.territories:
-                if attacker != defender:
-                    # Get densities once for efficiency
-                    attacker_units = self.get_color_density(minimap_image, attacker, hsv_ranges, minimap_mask)
-                    defender_units = self.get_color_density(minimap_image, defender, hsv_ranges, minimap_mask)
-                    
-                    # First detect field battles
-                    field_battles = self.detect_army_engagements(attacker_units, defender_units, minimap_mask)
-                    for battle in field_battles:
-                        raids.append({
-                            'position': battle['position'],
-                            'attacker': attacker,
-                            'defender': defender,
-                            'importance': battle['importance'],
-                            'raid_key': f"battle-{attacker}-{defender}-{battle['position'][0]}-{battle['position'][1]}",
-                            'is_field_battle': True
-                        })
-                    
-                    # Then check for base-oriented raids
-                    defender_base = self.territories[defender]['main_base']
-                    if defender_base:
-                        base_x, base_y = defender_base['position']
-                        
-                        # Calculate territory control radius
-                        scan_radius = 80
-                        defender_presence = defender_units[
-                            max(0, base_y - scan_radius):min(defender_units.shape[0], base_y + scan_radius),
-                            max(0, base_x - scan_radius):min(defender_units.shape[1], base_x + scan_radius)
-                        ]
-                        
-                        # Find the furthest significant defender presence
-                        significant_presence = defender_presence > self.scout_detection_threshold
-                        if np.any(significant_presence):
-                            y_indices, x_indices = np.where(significant_presence)
-                            distances = np.sqrt(
-                                (x_indices - scan_radius) ** 2 + 
-                                (y_indices - scan_radius) ** 2
-                            )
-                            max_distance = np.max(distances)
-                            detection_radius = max(40, int(max_distance * 1.2))
-                        else:
-                            detection_radius = 40
-                        
-                        y_start = max(0, base_y - detection_radius)
-                        y_end = min(attacker_units.shape[0], base_y + detection_radius)
-                        x_start = max(0, base_x - detection_radius)
-                        x_end = min(attacker_units.shape[1], base_x + detection_radius)
-                        
-                        roi = attacker_units[y_start:y_end, x_start:x_end]
-                        
-                        if np.max(roi) > self.scout_detection_threshold:
-                            y_coords, x_coords = np.where(roi > self.scout_detection_threshold)
-                            
-                            for y, x in zip(y_coords, x_coords):
-                                actual_x = x + x_start
-                                actual_y = y + y_start
-                                
-                                if minimap_mask is not None and not minimap_mask[actual_y, actual_x]:
-                                    continue
-                                
-                                dist_to_base = np.sqrt((actual_x - base_x)**2 + (actual_y - base_y)**2)
-                                
-                                territory_factor = 1.0
-                                if dist_to_base > detection_radius * 0.7:
-                                    territory_factor = 1.2
-                                
-                                base_importance = self.calculate_raid_importance(
-                                    (actual_x, actual_y),
-                                    attacker_units,
-                                    defender_units,
-                                    radius=30
-                                ) * territory_factor
-                                
-                                raid_key = f"{attacker}-{defender}-{actual_x}-{actual_y}"
-                                importance = self.adjust_importance_for_movement(
-                                    raid_key,
-                                    (actual_x, actual_y),
-                                    base_importance,
-                                    current_time
-                                )
-                                
-                                if importance > self.RAID_THRESHOLD:
-                                    raids.append({
-                                        'position': (actual_x, actual_y),
-                                        'attacker': attacker,
-                                        'defender': defender,
-                                        'importance': importance,
-                                        'raid_key': raid_key,
-                                        'is_frontier': dist_to_base > detection_radius * 0.7,
-                                        'is_field_battle': False
-                                    })
-        
-        # Clean up old raid history
-        self.cleanup_raid_history(current_time)
-        return self.cluster_raids(raids)
-    
 
+
+    def get_territory_mask(self, color):
+        """
+        Get a binary mask showing territory controlled by a specific color.
+        Returns a numpy array where 1 indicates controlled territory.
+        """
+        try:
+            if color not in self.territories:
+                return None
+                
+            if not self.territories[color]['main_base']:
+                return None
+                
+            # Create empty mask
+            territory_mask = np.zeros_like(self.heat_map) if self.heat_map is not None else None
+            if territory_mask is None:
+                return None
+                
+            # Get base position for reference
+            base_x, base_y = self.territories[color]['main_base']['position']
+            
+            # Create influence map around buildings
+            if 'building_positions' in self.territories[color]:
+                for x, y in self.territories[color]['building_positions']:
+                    # Create gaussian influence around each building
+                    y_indices, x_indices = np.ogrid[-y:territory_mask.shape[0]-y, -x:territory_mask.shape[1]-x]
+                    radius = 20  # Adjusted for minimap scale
+                    mask = x_indices*x_indices + y_indices*y_indices <= radius*radius
+                    territory_mask[mask] += 1
+            
+            # Add base influence
+            y_indices, x_indices = np.ogrid[-base_y:territory_mask.shape[0]-base_y, -base_x:territory_mask.shape[1]-base_x]
+            base_radius = 30  # Larger radius for main base
+            base_mask = x_indices*x_indices + y_indices*y_indices <= base_radius*base_radius
+            territory_mask[base_mask] += 2  # Higher weight for base area
+            
+            # Normalize to [0, 1]
+            if np.max(territory_mask) > 0:
+                territory_mask = territory_mask / np.max(territory_mask)
+            
+            return territory_mask
+
+        except Exception as e:
+            logging.error(f"Error generating territory mask: {e}")
+            return None
+
+
+    def detect_raids(self, minimap_image, hsv_ranges, minimap_mask=None):
+        """Detect raids with enhanced movement detection and proper minimap scaling"""
+        try:
+            raids = []
+            current_time = time.time()
+            
+            if not hasattr(self, 'prev_frame'):
+                self.prev_frame = {}
+            
+            for attacker in self.territories:
+                for defender in self.territories:
+                    if attacker != defender:
+                        attacker_units = self.get_color_density(minimap_image, attacker, hsv_ranges, minimap_mask)
+                        defender_density = self.get_color_density(minimap_image, defender, hsv_ranges, minimap_mask)
+                        
+                        if attacker_units is None:
+                            continue
+                        
+                        # Get movement map for attacker units
+                        movement_map = None
+                        if attacker in self.prev_frame and self.prev_frame[attacker] is not None:
+                            prev_density = self.prev_frame[attacker]
+                            if prev_density.shape == attacker_units.shape:
+                                movement_map = cv2.absdiff(attacker_units, prev_density)
+                        
+                        # Store current frame for next comparison
+                        self.prev_frame[attacker] = attacker_units.copy()
+                        
+                        # Look for raiding conditions
+                        defender_base = self.territories[defender]['main_base']
+                        if defender_base:
+                            base_x, base_y = defender_base['position']
+                            scan_radius = 40  # Reduced from 80 for minimap scale
+                            
+                            y_start = max(0, base_y - scan_radius)
+                            y_end = min(attacker_units.shape[0], base_y + scan_radius)
+                            x_start = max(0, base_x - scan_radius)
+                            x_end = min(attacker_units.shape[1], base_x + scan_radius)
+                            
+                            region = attacker_units[y_start:y_end, x_start:x_end]
+                            movement = None if movement_map is None else movement_map[y_start:y_end, x_start:x_end]
+                            
+                            # Look for significant unit presence
+                            significant_presence = region > self.scout_detection_threshold
+                            if np.any(significant_presence):
+                                y_indices, x_indices = np.where(significant_presence)
+                                
+                                for y, x in zip(y_indices, x_indices):
+                                    actual_x = x + x_start
+                                    actual_y = y + y_start
+                                    
+                                    # Skip if outside minimap
+                                    if minimap_mask is not None and not minimap_mask[actual_y, actual_x]:
+                                        continue
+                                    
+                                    # Skip if no movement
+                                    if movement is not None:
+                                        movement_score = movement[y, x]
+                                        if movement_score < 0.1:  # Skip stationary units
+                                            continue
+                                    
+                                    # Calculate distance from defender's base
+                                    dist_to_base = np.sqrt((actual_x - base_x)**2 + (actual_y - base_y)**2)
+                                    
+                                    # Calculate importance with movement priority
+                                    local_area = attacker_units[
+                                        max(0, actual_y - 15):min(attacker_units.shape[0], actual_y + 15),
+                                        max(0, actual_x - 15):min(attacker_units.shape[1], actual_x + 15)
+                                    ]
+                                    
+                                    unit_mass = np.sum(local_area > self.scout_detection_threshold)
+                                    size_score = min(0.6, unit_mass / 15)  # Reduced from 30
+                                    
+                                    # Movement score (highest priority)
+                                    movement_score = 0
+                                    if movement is not None:
+                                        local_movement = movement[
+                                            max(0, y - 15):min(movement.shape[0], y + 15),
+                                            max(0, x - 15):min(movement.shape[1], x + 15)
+                                        ]
+                                        movement_score = min(0.9, np.mean(local_movement) * 4.0)  # Increased multiplier
+                                    
+                                    # Distance factor (closer to enemy base = higher importance)
+                                    distance_factor = min(1.0, dist_to_base / 50)  # Reduced from 200
+                                    
+                                    # Calculate final importance
+                                    importance = (
+                                        movement_score * 0.7 +     # Movement highest priority
+                                        size_score * 0.4 +         # Unit mass matters but less
+                                        (1.0 - distance_factor) * 0.4  # Distance from base
+                                    )
+                                    
+                                    # Extra boost for being very close to enemy base
+                                    if dist_to_base < 25:  # Was 100
+                                        importance *= 2.0
+                                    
+                                    # Apply bonus for significant movement
+                                    if movement_score > 0.3:
+                                        importance *= 1.5
+                                    
+                                    if importance > self.RAID_THRESHOLD:
+                                        raids.append({
+                                            'position': (actual_x, actual_y),
+                                            'attacker': attacker,
+                                            'defender': defender,
+                                            'importance': importance,
+                                            'raid_key': f"{attacker}-{defender}-{actual_x}-{actual_y}",
+                                            'is_moving': movement_score > 0.1 if movement is not None else False,
+                                            'type': 'raid'
+                                        })
+
+            # Clean up old raid history
+            self.cleanup_raid_history(current_time)
+            
+            # Cluster similar raids
+            return self.cluster_raids(raids)
+                
+        except Exception as e:
+            logging.error(f"Error in detect_raids: {e}")
+            return []
+        
 
     def adjust_importance_for_movement(self, raid_key, current_pos, base_importance, current_time):
-        """Adjust raid importance based on movement history, with special handling for field battles."""
+        """Adjust raid importance with faster decay for static positions"""
         if raid_key not in self.raid_history:
             self.raid_history[raid_key] = {
                 'positions': [current_pos],
                 'last_update': current_time,
-                'last_movement': current_time
+                'last_movement': current_time,
+                'static_time': 0
             }
             return base_importance
         
@@ -800,24 +2252,32 @@ class TerritoryTracker:
             (current_pos[1] - last_pos[1])**2
         )
         
-        # Update position history if significant movement detected
+        # Update position history if significant movement
         if distance > self.min_movement_threshold:
             history['positions'].append(current_pos)
             history['last_movement'] = current_time
+            history['static_time'] = 0
             time_since_movement = 0
             
             if len(history['positions']) > 5:
                 history['positions'].pop(0)
+        else:
+            history['static_time'] += current_time - history['last_update'] * 1.2
         
         history['last_update'] = current_time
         
-        # Different staleness calculations for field battles vs raids
-        if 'battle-' in raid_key:  # Field battle
-            staleness_factor = max(0.6, 1.0 - (time_since_movement / (self.staleness_threshold * 1.5)))
-        else:  # Regular raid
-            staleness_factor = max(0.2, 1.0 - (time_since_movement / self.staleness_threshold))
+        # Enhanced staleness calculation
+        static_penalty = min(0.6, history['static_time'] / 8.0)  # Faster decay for static positions
+        movement_bonus = min(0.5, distance / 15.0)  # Bonus for movement
+        
+        staleness_factor = max(0.15, 
+            1.0 - (time_since_movement / self.staleness_threshold) - static_penalty + movement_bonus
+        )
         
         return base_importance * staleness_factor
+
+
+
 
     def cleanup_raid_history(self, current_time):
         """Remove old raid records."""
@@ -831,56 +2291,39 @@ class TerritoryTracker:
         for key in keys_to_remove:
             del self.raid_history[key]
 
-    def calculate_raid_importance(self, position, attacker_density, defender_density=None, radius=30):
-        """Calculate raid importance prioritizing army proximity and meaningful movement."""
+    def calculate_raid_importance(self, position, attacker_density, defender_density, movement_map=None, radius=30):
+        """Calculate raid importance with enhanced movement priority"""
         x, y = position
-        y_start = max(0, y - radius)
-        y_end = min(attacker_density.shape[0], y + radius)
-        x_start = max(0, x - radius)
-        x_end = min(attacker_density.shape[1], x + radius)
+        local_area = self.get_local_area(attacker_density, x, y, radius)
         
-        local_area = attacker_density[y_start:y_end, x_start:x_end]
+        # Base importance from unit presence
+        unit_mass = np.sum(local_area > self.scout_detection_threshold)
+        size_score = min(0.6, unit_mass / 30)  # Lower base importance
         
-        # Proximity score - check wider radius for nearby units
-        proximity_score = 0
-        if defender_density is not None:
-            # Use larger radius for proximity check
-            prox_radius = radius * 2
-            prox_y_start = max(0, y - prox_radius)
-            prox_y_end = min(attacker_density.shape[0], y + prox_radius)
-            prox_x_start = max(0, x - prox_radius)
-            prox_x_end = min(attacker_density.shape[1], x + prox_radius)
-            
-            attacker_presence = attacker_density[prox_y_start:prox_y_end, prox_x_start:prox_x_end]
-            defender_presence = defender_density[prox_y_start:prox_y_end, prox_x_start:prox_x_end]
-            
-            # Calculate proximity based on both armies having units within radius
-            if (np.max(attacker_presence) > self.scout_detection_threshold and 
-                np.max(defender_presence) > self.scout_detection_threshold):
-                proximity_score = 0.95  # High priority for nearby armies
+        # Movement score (highest priority)
+        movement_score = 0
+        if movement_map is not None:
+            movement_local = self.get_local_area(movement_map, x, y, radius)
+            movement = np.mean(movement_local)
+            movement_score = min(0.9, movement * 3.0)  # Higher cap for movement
         
-        # Movement calculation - reduced sensitivity
-        movement_importance = 0
-        if self.prev_frame is not None:
-            prev_local = self.prev_frame[y_start:y_end, x_start:x_end]
-            if prev_local.shape == local_area.shape:
-                diff = cv2.absdiff(local_area, prev_local)
-                movement = np.mean(diff)
-                movement_importance = min(0.7, movement * 3.0)  # Reduced multiplier
+        # Distance from defender's base (for raid validation)
+        defender_base = self.territories[self.current_defender]['main_base']
+        if defender_base:
+            dist_to_base = self.calculate_distance(position, defender_base['position'])
+            distance_factor = min(1.0, dist_to_base / 200)  # Further = less likely to be a raid
+        else:
+            distance_factor = 0.5
         
-        # Static importance - slightly increased for forward buildings
-        unit_presence = np.sum(local_area > self.scout_detection_threshold)
-        static_importance = min(0.4, unit_presence / 25)  # Increased cap
-        
-        # Final importance calculation
-        importance = max(
-            proximity_score * 0.95,    # Highest weight for nearby armies
-            movement_importance * 0.8, # Moderate weight for movement
-            static_importance * 0.3   # Slightly increased weight for static presence
+        # Calculate final importance
+        importance = (
+            movement_score * 0.5 +  # Movement is highest priority
+            size_score * 0.3 +      # Unit mass matters but less
+            (1.0 - distance_factor) * 0.2  # Distance from base
         )
         
-        self.prev_frame = attacker_density.copy()
-        return importance
+        return importance * (1.5 if movement_score > 0.3 else 1.0)  # Bonus for significant movement
+    
 
     def cluster_raids(self, raids):
         """Cluster nearby raid detections to prevent duplicates."""
@@ -941,4 +2384,67 @@ class TerritoryTracker:
             
             cv2.imwrite('debug_heatmap.png', heat_vis)
 
+    def update_territory_understanding(self, minimap_image, hsv_ranges, minimap_mask=None):
+        """Build comprehensive territory understanding over time."""
+        territory_map = np.zeros_like(minimap_image[:,:,0], dtype=np.float32)
+        
+        for color in self.territories:
+            # Get current density
+            density = self.get_color_density(minimap_image, color, hsv_ranges, minimap_mask)
+            
+            # Track building positions (more stable than units)
+            building_mask = cv2.inRange(
+                cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV),
+                np.array(hsv_ranges[color]['icon']['lower'], dtype=np.uint8),
+                np.array(hsv_ranges[color]['icon']['upper'], dtype=np.uint8)
+            )
+            
+            if 'building_positions' not in self.territories[color]:
+                self.territories[color]['building_positions'] = []
+            
+            # Find building contours
+            contours, _ = cv2.findContours(building_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                if cv2.contourArea(contour) > self.BUILDING_ICON_MIN_AREA:
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        self.territories[color]['building_positions'].append((cx, cy))
+            
+            # Create territory influence map
+            if self.territories[color]['building_positions']:
+                for x, y in self.territories[color]['building_positions']:
+                    # Add gaussian influence around each building
+                    influence_radius = 20  # Was 40
+                    y_coords, x_coords = np.ogrid[-y:territory_map.shape[0]-y, -x:territory_map.shape[1]-x]
+                    mask = x_coords*x_coords + y_coords*y_coords <= influence_radius*influence_radius
+                    territory_map[mask] += 1
+        
+        # Normalize and store
+        if np.max(territory_map) > 0:
+            territory_map = territory_map / np.max(territory_map)
+        self.territory_map = territory_map
+        
+        # Enhanced visualization
+        debug_img = minimap_image.copy()
+        for color in self.territories:
+            if self.territories[color]['building_positions']:
+                color_val = {"Blue": (255, 0, 0), "Red": (0, 0, 255)}[color]
+                
+                # Draw building positions
+                for x, y in self.territories[color]['building_positions']:
+                    cv2.circle(debug_img, (x, y), 2, color_val, -1)
+                
+                # Draw territory boundaries
+                territory_mask = (territory_map > 0.3).astype(np.uint8)
+                contours, _ = cv2.findContours(territory_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(debug_img, contours, -1, color_val, 1)
+        
+        cv2.imwrite('debug_territory_understanding.png', debug_img)
+        
+        # Also save territory heatmap
+        territory_heat = (territory_map * 255).astype(np.uint8)
+        territory_heat = cv2.applyColorMap(territory_heat, cv2.COLORMAP_JET)
+        cv2.imwrite('debug_territory_heat.png', territory_heat)
 
