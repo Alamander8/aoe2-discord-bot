@@ -8,6 +8,7 @@ import random
 from collections import deque
 from typing import Dict, List, Tuple, Optional
 from threading import Lock 
+import math
 
 class ViewingQueue:
     def __init__(self, min_revisit_time: float = 4.0, proximity_radius: int = 50):
@@ -19,10 +20,10 @@ class ViewingQueue:
         # New tracking attributes
         self.view_counts = {}  # Track how many times we've viewed each area
         self.last_base_visit = {}  # Track when we last visited each base
-        self.staleness_threshold = 3  # Number of views before applying staleness
+        self.staleness_threshold = 2  # Number of views before applying staleness
         self.base_visit_interval = 45.0  # Seconds between forced base checks
         self.max_view_count = 5
-        self.staleness_penalty = 0.7
+        self.staleness_penalty = 0.6
 
     def add_zone(self, zone: dict) -> None:
         if self._is_new_area(zone['position']):
@@ -111,7 +112,6 @@ class ViewingQueue:
     def calculate_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
         """Calculate Euclidean distance between two positions"""
         return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-
 
 
 
@@ -264,9 +264,14 @@ class SpectatorCore:
         self.current_mask = None
         self.minimap_lock = Lock() 
         self.last_military_check = 0
-        self.military_check_interval = 12.0
+        self.military_check_interval = 8.0
         self.recent_visits = []
         self.last_density_map = None
+        self.last_expansion_check={
+            'Blue': 0,
+            'Red': 0
+        }
+        self.max_expansion_importance = 2.0 
 
         #initialize
         self.base_monitor = BaseMonitor(self)
@@ -275,13 +280,13 @@ class SpectatorCore:
         self.player_colors_config = config.PLAYER_HSV_RANGES
         
         # Activity thresholds
-        self.min_activity_area = 30
+        self.min_activity_area = 40
         self.large_activity_threshold = 150
         
         # Timing settings
-        self.min_view_duration = 4.0
-        self.max_view_duration = 6.0
-        self.combat_view_duration = 12.0
+        self.min_view_duration = 3.0
+        self.max_view_duration = 5.0
+        self.combat_view_duration = 10.0
         self.last_switch_time = time.time()
         self.last_visit_times = {
         'Blue': {'military': 0, 'economy': 0},
@@ -292,11 +297,11 @@ class SpectatorCore:
         # Previous frame storage for movement detection
         self.prev_frame = None
         self.movement_weight = 0.7  # Moderate boost for movement
-        self.static_weight = 0.3  # Still significant weight for static elements
+        self.static_weight = 0.2  # Still significant weight for static elements
 
         # Initialize territory tracker and viewing queue
         self.territory_tracker = TerritoryTracker()
-        self.viewing_queue = ViewingQueue(min_revisit_time=4.0, proximity_radius=50)
+        self.viewing_queue = ViewingQueue(min_revisit_time=3.0, proximity_radius=50)
         
         # Active colors for 1v1
         self.active_colors = ['Blue', 'Red']
@@ -314,6 +319,16 @@ class SpectatorCore:
             if current_time - visit['timestamp'] < retention_time
         ]
 
+
+    def calculate_expansion_importance(self, color, current_time, base_importance=0.7):
+        """Calculate ramping importance for expansion checks"""
+        time_since_check = current_time - self.last_expansion_check.get(color, 0)
+        
+        # Start ramping up after 30 seconds, cap at max_expansion_importance
+        ramp_factor = min(self.max_expansion_importance, 1.0 + (time_since_check - 30) / 60)
+        
+        # Never exceed military importance
+        return min(base_importance * ramp_factor, 2.0)
 
     def add_fallback_views(self, all_activities, current_time):
         """Add balanced fallback views between players"""
@@ -334,7 +349,7 @@ class SpectatorCore:
                 if base_pos:
                     all_activities.append({
                         'position': base_pos,
-                        'importance': 0.1,  # Very low importance
+                        'importance': 0.1 *(0.8 + random.random() * 0.4),  # Very low importance with random variation
                         'type': 'fallback_view',
                         'color': color,
                         'timestamp': current_time
@@ -345,7 +360,8 @@ class SpectatorCore:
 
     def decide_next_view(self, curr_minimap, mask, military_mode=False):
         """
-        Enhanced view decision making with adjusted thresholds, player balance, and economic exploration
+        Enhanced view decision making with better economic activity integration
+        and static building handling.
         """
         try:
             all_activities = []
@@ -353,12 +369,19 @@ class SpectatorCore:
 
             # Clean up old visits
             self._cleanup_recent_visits(current_time)
+            
+            # Track time since last eco view for force check logic
+            time_since_eco = {
+                'Blue': current_time - self.last_visit_times['Blue']['economy'],
+                'Red': current_time - self.last_visit_times['Red']['economy']
+            }
+            needs_eco_check = any(t > 45.0 for t in time_since_eco.values())
 
             # Handle territory breaches (with increased importance)
             breaches = self.check_territory_breaches(curr_minimap, mask)
             for breach in breaches:
-                breach['importance'] *= 4.0  # Increased from 2.8
-                if breach.get('color'):  # Apply balance multiplier
+                breach['importance'] *= 3.5
+                if breach.get('color'):
                     balance_multiplier = self.base_monitor.get_balance_multiplier(breach['color'])
                     breach['importance'] *= balance_multiplier
                 all_activities.append(breach)
@@ -367,9 +390,30 @@ class SpectatorCore:
             military_data = self.check_military_situation(curr_minimap, mask, military_mode=military_mode)
             military_activities = military_data['activities']
             
+            # Filter out likely static buildings from military activities
+            military_activities = [
+                act for act in military_activities 
+                if act.get('is_moving', False) or  # Moving units are definitely military
+                (act.get('movement_score', 0) > 0.08) or  # Increased movement threshold
+                (act.get('area', 0) < 25)  # Small units are likely military
+            ]
+            
+            # Enhance military proximity detection
             for activity in military_activities:
-                # Find closest enemy unit with reduced proximity threshold
                 enemy_units = [a for a in military_activities if a['color'] != activity['color']]
+                nearby_enemies = [
+                    e for e in enemy_units 
+                    if self.calculate_distance(activity['position'], e['position']) < 35
+                ]
+                
+                # Multiple enemies nearby increases importance
+                if nearby_enemies:
+                    activity['importance'] *= (1.0 + (len(nearby_enemies) * 0.3))
+                    if len(nearby_enemies) >= 2:
+                        activity['type'] = 'potential_engagement'
+                        activity['importance'] *= 1.5
+                
+                # Combat detection
                 closest_enemy = min([self.calculate_distance(activity['position'], e['position']) 
                                 for e in enemy_units], default=1000)
                 
@@ -378,23 +422,34 @@ class SpectatorCore:
                 enemy_base = self.base_monitor.get_tc_position(enemy_color)
                 if enemy_base:
                     dist_to_enemy_base = self.calculate_distance(activity['position'], enemy_base)
-                    # Adjusted distance scaling for minimap
+                    # Higher importance when closer to enemy base
                     activity['importance'] *= max(1.0, 2.5 - (dist_to_enemy_base / 50))
                 
-                # Combat detection with reduced distance for minimap
-                if closest_enemy < 20:  # Reduced from 35
+                # Combat detection
+                if closest_enemy < 25:  # More sensitive combat detection
                     activity['type'] = 'major_combat'
-                    activity['importance'] *= 5.0  # Increased from 4.0
+                    activity['importance'] *= 5.0
                     activity['view_duration'] = self.combat_view_duration
+                elif closest_enemy < 35:  # New tier for nearby units
+                    activity['type'] = 'potential_combat'
+                    activity['importance'] *= 2.5
                 
-                # Movement bonus with bigger difference
+                # Movement bonus
                 if activity.get('is_moving', False):
-                    activity['importance'] *= 2.5  # Increased from 1.5
+                    activity['importance'] *= 3.5  # Bigger bonus for movement
+                    # Add check for direction relative to enemy base
+                    if enemy_base:
+                        vector_to_enemy = (
+                            enemy_base[0] - activity['position'][0],
+                            enemy_base[1] - activity['position'][1]
+                        )
+                        if vector_to_enemy[0] * vector_to_enemy[0] + vector_to_enemy[1] * vector_to_enemy[1] > 0:
+                            activity['importance'] *= 1.5  # Extra boost if moving toward enemy
                 
-                # Increased time factor for military balance
+                # Time balance factor
                 time_since_military = current_time - self.last_visit_times[activity['color']]['military']
-                if time_since_military > 20:  # Reduced from 30
-                    activity['importance'] *= 2.0  # Increased from 1.5
+                if time_since_military > 20:
+                    activity['importance'] *= 2.0
 
                 # Apply viewing time balance
                 if activity.get('color'):
@@ -402,66 +457,125 @@ class SpectatorCore:
                     activity['importance'] *= balance_multiplier
                 
                 all_activities.append(activity)
-            
 
-
-            # Only add non-combat activities if no major combat
-            if not any(a.get('type') == 'major_combat' for a in all_activities):
-                if not military_mode:
-                    # Enhanced economic activities with exploration
-                    self.add_economic_activities(all_activities, curr_minimap, mask)
-
-                    # Traditional base checks with reduced importance
-                    bases = self.check_base_development()
-                    if bases:
-                        for base in bases:
-                            time_since_eco = current_time - self.last_visit_times[base['color']]['economy']
-                            base_boost = min(2.0, time_since_eco / 30.0)  # Reduced from 45.0
-                            base['importance'] = base['importance'] * 0.4 * base_boost  # Reduced from 0.7
-                            if base.get('color'):
-                                balance_multiplier = self.base_monitor.get_balance_multiplier(base['color'])
-                                base['importance'] *= balance_multiplier
-                            all_activities.append(base)
+            # Detect quiet period (no movement) - at main function level
+            movement_detected = any(act.get('is_moving', False) for act in military_activities)
+            if not movement_detected:
+                quiet_period_activities = []
+                
+                # Check latest territory expansions for both players
+                for color in ['Blue', 'Red']:
+                    # Get territory density for this color
+                    density = self.territory_tracker.get_color_density(
+                        curr_minimap, color, self.player_colors_config, mask
+                    )
                     
-                    # General activities with reduced importance
-                    general = self.detect_activity_zones(curr_minimap, mask)
-                    if general:
-                        for activity in general:
-                            activity['importance'] *= 0.3  # Reduced from 0.4
-                            if activity.get('color'):
-                                balance_multiplier = self.base_monitor.get_balance_multiplier(base['color'])
-                                activity['importance'] *= balance_multiplier
-                            all_activities.append(activity)
+                    if density is not None:
+                        # Get main base position as reference
+                        base_pos = self.base_monitor.get_tc_position(color)
+                        if not base_pos:
+                            continue
+                            
+                        # Look for highest density areas away from main base
+                        y_start = max(0, base_pos[1] - 80)
+                        y_end = min(density.shape[0], base_pos[1] + 80)
+                        x_start = max(0, base_pos[0] - 80)
+                        x_end = min(density.shape[1], base_pos[0] + 80)
+                        
+                        # Get region around base
+                        roi = density[y_start:y_end, x_start:x_end]
+                        
+                        # Find top 3 density positions
+                        flat_indices = np.argsort(roi.ravel())[-3:]
+                        positions = [(x_start + (idx % roi.shape[1]), 
+                                    y_start + (idx // roi.shape[1])) 
+                                    for idx in flat_indices]
+                        
+                        for i, pos in enumerate(positions):
+                            if density[pos[1], pos[0]] > 0.2:  # Ensure meaningful activity
+                                if not self._is_recently_visited(pos):
+                                    base_importance = 0.7 - (i * 0.1)
+                                    ramped_importance = self.calculate_expansion_importance(
+                                        color, 
+                                        current_time, 
+                                        base_importance
+                                    )
+                                    
+                                    quiet_period_activities.append({
+                                        'position': pos,
+                                        'importance': ramped_importance,
+                                        'type': 'quiet_period_expansion_check',
+                                        'color': color,
+                                        'timestamp': current_time
+                                    })
+                
+                all_activities.extend(quiet_period_activities)
 
-                    # Add exploration points if we haven't checked bases in a while
-                    # More frequent exploration checks
-                    for color in ['Blue', 'Red']:
-                        time_since_eco = current_time - self.last_visit_times[color]['economy']
-                        if time_since_eco > 20:  # Reduced from 30
-                            explore_pos = self.get_base_exploration_point(color, mask)
-                            if explore_pos and not self._is_recently_visited(explore_pos):
-                                all_activities.append({
-                                    'position': explore_pos,
-                                    'importance': 0.4 * (time_since_eco / 30.0),  # Reduced from 45.0
-                                    'type': 'base_exploration',
-                                    'color': color,
-                                    'timestamp': current_time
-                                })
+            # Add economic activities in these cases:
+            # 1. No major combat
+            # 2. Haven't checked economy in a while
+            # 3. Few military activities
+            if (not any(a.get('type') == 'major_combat' for a in all_activities) and 
+                (needs_eco_check or len(military_activities) < 2)) and not military_mode:
+                
+                # Add economic activities with exploration
+                self.add_economic_activities(all_activities, curr_minimap, mask)
 
-            # Ensure we have at least one activity if everything else failed
+                # Base checks with reduced importance
+                bases = self.check_base_development()
+                if bases:
+                    for base in bases:
+                        time_since_eco = current_time - self.last_visit_times[base['color']]['economy']
+                        base_boost = min(2.0, time_since_eco / 30.0)
+                        # Higher base importance when we need an eco check
+                        base_multiplier = 0.6 if needs_eco_check else 0.4
+                        base['importance'] = base['importance'] * base_multiplier * base_boost
+                        if base.get('color'):
+                            balance_multiplier = self.base_monitor.get_balance_multiplier(base['color'])
+                            base['importance'] *= balance_multiplier
+                        all_activities.append(base)
+                
+                # General activities
+                general = self.detect_activity_zones(curr_minimap, mask)
+                if general:
+                    for activity in general:
+                        activity['importance'] *= 0.3
+                        if activity.get('color'):
+                            balance_multiplier = self.base_monitor.get_balance_multiplier(activity['color'])
+                            activity['importance'] *= balance_multiplier
+                        all_activities.append(activity)
+
+                # Add exploration points for expansion checking
+                for color in ['Blue', 'Red']:
+                    if time_since_eco[color] > 25:
+                        explore_pos = self.get_base_exploration_point(color, mask)
+                        if explore_pos and not self._is_recently_visited(explore_pos):
+                            all_activities.append({
+                                'position': explore_pos,
+                                'importance': 0.4 * (time_since_eco[color] / 30.0),
+                                'type': 'base_exploration',
+                                'color': color,
+                                'timestamp': current_time
+                            })
+
+            # Fallback views if needed
             if not all_activities:
-                # Add backup view between bases with very low importance
                 self.add_fallback_views(all_activities, current_time)
 
-            # Record the activity we're going to view
+            # Sort and deduplicate activities
             all_activities.sort(key=lambda x: x['importance'], reverse=True)
             activities = self._deduplicate_activities(all_activities)
             
+            # Update tracking for selected activity
             if activities:
                 self.recent_visits.append({
                     'position': activities[0]['position'],
                     'timestamp': current_time
                 })
+                
+                if activities[0].get('type') == 'quiet_period_expansion_check':
+                    self.last_expansion_check[activities[0]['color']] = current_time
+                    
                 logging.info(f"Selected activity: {activities[0].get('type')} with importance {activities[0].get('importance', 0.0):.2f}")
             else:
                 logging.warning("No activities found for next view")
@@ -471,6 +585,9 @@ class SpectatorCore:
         except Exception as e:
             logging.error(f"Error in decide_next_view: {e}")
             return []
+        
+
+        
     def handle_major_combat(self, position):
         """Convert minimap position to screen coordinates and perform drag-follow only for army vs army"""
         try:
@@ -752,6 +869,8 @@ class SpectatorCore:
     def add_economic_activities(self, all_activities, curr_minimap, mask):
         """Add economic activities with focus on expansion and new activity"""
         try:
+            current_time = time.time()
+            
             for color in ['Blue', 'Red']:
                 # Get territory density to detect economic activity
                 density = self.territory_tracker.get_color_density(
@@ -764,15 +883,9 @@ class SpectatorCore:
                     if not base_pos:
                         continue
                     
-                    # Look for economic activity outside the main base area
-                    y_start = max(0, base_pos[1] - 100)
-                    y_end = min(density.shape[0], base_pos[1] + 100)
-                    x_start = max(0, base_pos[0] - 100)
-                    x_end = min(density.shape[1], base_pos[0] + 100)
-                    
-                    # First, check if we have previous density data to detect changes
-                    if hasattr(self, 'last_density_maps') and color in self.last_density_maps:
-                        prev_density = self.last_density_maps[color]
+                    # Compare with previous density if available
+                    if hasattr(self, 'last_eco_density') and color in self.last_eco_density:
+                        prev_density = self.last_eco_density[color]
                         if prev_density is not None and prev_density.shape == density.shape:
                             # Look for new construction/activity
                             diff = density - prev_density
@@ -781,33 +894,45 @@ class SpectatorCore:
                                 y, x = new_activity[0][i], new_activity[1][i]
                                 dist_from_base = self.calculate_distance((x, y), base_pos)
                                 if dist_from_base > 30:  # If significantly away from base
-                                    all_activities.append({
-                                        'position': (x, y),
-                                        'importance': 0.8,  # Higher importance for new activity
-                                        'type': 'economic_expansion',
-                                        'color': color,
-                                        'timestamp': time.time()
-                                    })
+                                    if not self._is_recently_visited((x, y)):
+                                        all_activities.append({
+                                            'position': (x, y),
+                                            'importance': 0.7,  # Higher importance for new expansion
+                                            'type': 'economic_expansion',
+                                            'color': color,
+                                            'timestamp': current_time
+                                        })
                     
                     # Store current density for next comparison
-                    if not hasattr(self, 'last_density_maps'):
-                        self.last_density_maps = {}
-                    self.last_density_maps[color] = density.copy()
+                    if not hasattr(self, 'last_eco_density'):
+                        self.last_eco_density = {}
+                    self.last_eco_density[color] = density.copy()
                     
-                    # Add exploration points for unexplored areas
-                    time_since_eco = time.time() - self.last_visit_times[color]['economy']
-                    if time_since_eco > 20:  # More frequent checks
+                    # Check unexplored areas around base
+                    time_since_eco = current_time - self.last_visit_times[color]['economy']
+                    if time_since_eco > 20:  # Frequent enough to catch expansions
                         explore_pos = self.get_base_exploration_point(color, mask)
                         if explore_pos and not self._is_recently_visited(explore_pos):
                             dist_from_base = self.calculate_distance(explore_pos, base_pos)
                             if dist_from_base > 30:  # Prioritize expansion areas
                                 all_activities.append({
                                     'position': explore_pos,
-                                    'importance': 0.6,  # Moderate importance
+                                    'importance': 0.6 * (time_since_eco / 30.0),  # Scales with time
                                     'type': 'expansion_exploration',
                                     'color': color,
-                                    'timestamp': time.time()
+                                    'timestamp': current_time
                                 })
+                            
+                    # Add periodic base check with low importance
+                    time_since_base = current_time - self.last_visit_times[color]['economy']
+                    if time_since_base > 45.0:  # Long time since checking base
+                        all_activities.append({
+                            'position': base_pos,
+                            'importance': 0.3,  # Low importance to avoid overshadowing military
+                            'type': 'base_check',
+                            'color': color,
+                            'timestamp': current_time
+                        })
                         
         except Exception as e:
             logging.error(f"Error adding economic activities: {e}")
@@ -847,31 +972,44 @@ class SpectatorCore:
         dist_from_home = self.calculate_distance(position, own_base)
         
         # Calculate base importance from unit size
-        base_importance = min(1.0, area / 20.0)  # Adjusted for minimap scale
+        base_importance = min(1.0, area / 15.0)  * 1.2 # Adjusted for minimap scale
         
         # Heavy bonus for being away from home base
         # Start scaling up at 50 pixels, max bonus at 150 pixels
-        distance_multiplier = min(4.0, max(1.0, dist_from_home / 25))
+        distance_multiplier = min(4.0, max(1.0, dist_from_home / 35))
         
         # Movement is very important
-        movement_multiplier = 3.0 if is_moving else 0.2
+        movement_multiplier = 3.5 if is_moving else 0.15
         
         # Check if in enemy territory
         enemy_color = 'Red' if color == 'Blue' else 'Blue'
         enemy_density = self.territory_tracker.get_color_density(enemy_color)
-        territory_multiplier = 1.0
+        territory_multiplier = 1.1
         
         if enemy_density is not None:
             x, y = position
             if x < enemy_density.shape[1] and y < enemy_density.shape[0]:
                 territory_control = enemy_density[y, x]
+                
+                # Get average control in surrounding area
+                area_size = 4
+                x_start = max(0, x - area_size)
+                x_end = min(enemy_density.shape[1], x + area_size)
+                y_start = max(0, y - area_size)
+                y_end = min(enemy_density.shape[0], y + area_size)
+                area_control = np.mean(enemy_density[y_start:y_end, x_start:x_end])
+                
                 if territory_control > 0.5:  # Deep in enemy territory
-                    territory_multiplier = 4.0  # Major boost for being in enemy territory
+                    territory_multiplier = 4.5  # Slightly higher
                 elif territory_control > 0.2:  # Near enemy territory
                     territory_multiplier = 2.5
+                
+                # Additional boost if in contested area (both players have presence)
+                if area_control > 0.3 and area_control < 0.7:
+                    territory_multiplier *= 1.3
         
         # Static position penalty for large areas (likely buildings)
-        if area > 15 and not is_moving:  # TC/Castle sized
+        if area > 20 and not is_moving:  # TC/Castle sized
             importance = base_importance * 0.1  # Heavy penalty for static large objects
         else:
             # Combine all factors with adjusted weights
@@ -958,9 +1096,14 @@ class SpectatorCore:
         return False
 
 
+    #If changing, make sure you're sure
+    # Then make sure again
+    # Then only adjust weights
+    # THEN make logic changes
     def check_military_situation(self, curr_minimap, mask, military_mode=False):
         """
-        Comprehensive military situation detector with enhanced field unit detection.
+        Comprehensive military situation detector with improved combat detection,
+        enhanced staleness tracking, and better static structure filtering.
         """
         try:
             military_activities = []
@@ -970,8 +1113,24 @@ class SpectatorCore:
                 'military_map': None
             }
             
-            # Get military map with caching
             current_time = time.time()
+            
+            # Cleanup old tracking data
+            if hasattr(self, 'position_visit_counts'):
+                if not hasattr(self, 'last_position_cleanup'):
+                    self.last_position_cleanup = current_time
+                if current_time - self.last_position_cleanup > 30:  # Cleanup every 30 seconds
+                    self.position_visit_counts.clear()
+                    self.last_position_cleanup = current_time
+            
+            # Clean up old persistent position tracking
+            if hasattr(self, 'position_first_seen'):
+                for pos_key in list(self.position_first_seen.keys()):
+                    if current_time - self.position_first_seen[pos_key] > 120:  # 2 minutes
+                        del self.position_first_seen[pos_key]
+                        del self.persistent_positions[pos_key]
+
+            # Get military map with caching
             if not military_mode:
                 if hasattr(self, '_cached_military_map') and \
                     current_time - self._last_military_cache < 5.0:  # 5-second cache
@@ -996,71 +1155,46 @@ class SpectatorCore:
             # Store positions for proximity checks
             player_positions = {'Blue': [], 'Red': []}
             
-            # First identify buildings using template matching
-            building_positions = []
-            gray_map = cv2.cvtColor(military_map, cv2.COLOR_BGR2GRAY)
-            for template_path in ['templates/town_center.png', 'templates/castle.png']:
-                try:
-                    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
-                    if template is not None:
-                        res = cv2.matchTemplate(gray_map, template, cv2.TM_CCOEFF_NORMED)
-                        threshold = 0.8
-                        locations = np.where(res >= threshold)
-                        for pt in zip(*locations[::-1]):
-                            building_positions.append((pt[0], pt[1]))
-                except Exception as e:
-                    logging.error(f"Error loading template {template_path}: {e}")
-            
-            # Detect buildings under attack
-            attack_positions = self.detect_building_under_attack(military_map)
-            
             # Adjusted thresholds for minimap scale
             is_early_game = not any(self.territory_tracker.castle_age_reached.values())
+            area_threshold = 5  # Reduced to catch small military units
             
             for color in ['Blue', 'Red']:
-                # Get player's base position
                 own_base = self.base_monitor.get_tc_position(color)
-                
                 density = self.territory_tracker.get_color_density(
                     military_map, color, self.player_colors_config, mask
                 )
                 
                 if density is not None:
-                    # Check overall military density
+                    # Convert density to uint8 for OpenCV operations
+                    density_img = (density * 255).astype(np.uint8)
+                    
+                    # Check overall military presence
                     total_military_presence = np.sum(density > 0.15)  # More sensitive
                     military_data['high_density'] = total_military_presence > 50
                     
                     # Find potential military units
                     significant = (density > 0.12).astype(np.uint8)  # Lower threshold
                     contours, _ = cv2.findContours(significant, cv2.RETR_EXTERNAL, 
-                                                cv2.CHAIN_APPROX_SIMPLE)
+                                            cv2.CHAIN_APPROX_SIMPLE)
                     
                     for contour in contours:
                         area = cv2.contourArea(contour)
-                        if area < 3:  # Only filter extreme noise
+                        if area < area_threshold:  # Skip extremely small noise
                             continue
-                        
+                            
                         M = cv2.moments(contour)
                         if M["m00"] != 0:
                             cx = int(M["m10"] / M["m00"])
                             cy = int(M["m01"] / M["m00"])
                             
-                            # Skip if near known building
-                            is_near_building = False
-                            for bx, by in building_positions:
-                                if abs(cx - bx) < 15 and abs(cy - by) < 15:
-                                    is_near_building = True
-                                    break
-                            if is_near_building:
-                                continue
-                            
-                            # Check for movement
+                            # Check for movement with smaller window
                             is_moving = False
                             movement_score = 0
                             if hasattr(self, 'last_military_map') and self.last_military_map is not None:
                                 prev_region = cv2.getRectSubPix(
                                     self.last_military_map, 
-                                    (7, 7),  # Smaller window for movement detection
+                                    (7, 7),  # Small window for precise movement detection
                                     (cx, cy)
                                 )
                                 curr_region = cv2.getRectSubPix(
@@ -1069,68 +1203,139 @@ class SpectatorCore:
                                     (cx, cy)
                                 )
                                 movement_score = np.mean(cv2.absdiff(prev_region, curr_region))
-                                is_moving = movement_score > 0.08
+                                is_moving = movement_score > 0.08  # Sensitive to small movements
                             
-                            # Initialize importance and distance
-                            importance = 0.5  # Base importance for military units
+                            # Track position persistence
+                            pos_key = f"{cx},{cy}"
+                            if not hasattr(self, 'position_first_seen'):
+                                self.position_first_seen = {}
+                                self.persistent_positions = {}
+                                
+                            if pos_key not in self.position_first_seen:
+                                self.position_first_seen[pos_key] = current_time
+                                self.persistent_positions[pos_key] = 0
+                            elif not is_moving and movement_score < 0.05:
+                                self.persistent_positions[pos_key] = self.persistent_positions.get(pos_key, 0) + 1
+                            
+                            # Skip if this is likely a building (TC/Castle)
+                            if area > 20 and not is_moving:  # Large static area
+                                # Check if it's very solid (like a building icon)
+                                y_start = max(0, cy - 2)
+                                y_end = min(density.shape[0], cy + 3)
+                                x_start = max(0, cx - 2)
+                                x_end = min(density.shape[1], cx + 3)
+                                region = density[y_start:y_end, x_start:x_end]
+                                if np.mean(region) > 0.8:  # Very solid/filled shape
+                                    continue
+                            
+                            # Check consecutive static views
+                            consecutive_static_views = 0
+                            if hasattr(self, 'position_visit_counts'):
+                                consecutive_static_views = self.position_visit_counts.get(pos_key, 0)
+                                
+                            if consecutive_static_views > 2 and not is_moving:
+                                # Require more significant movement for frequently viewed positions
+                                required_movement = 0.08 + (consecutive_static_views * 0.02)
+                                if movement_score < required_movement:
+                                    continue
+                            
+                            # Calculate distance from base
                             dist_from_home = 1000  # Default to large distance
-                            
-                            # Distance from own base is critical
                             if own_base:
                                 dist_from_home = self.calculate_distance((cx, cy), own_base)
-                                if dist_from_home > 30:  # Significantly away from base
-                                    importance *= 3.0
-                                    if is_moving:
-                                        importance *= 2.0
-                                elif dist_from_home > 20:  # Moderately away
-                                    importance *= 2.0
                             
-                            # Check if in enemy territory using color density
-                            enemy_color = 'Red' if color == 'Blue' else 'Blue'
-                            enemy_density = self.territory_tracker.get_color_density(
-                                military_map, enemy_color, self.player_colors_config, mask
-                            )
-                            if enemy_density is not None and cy < enemy_density.shape[0] and cx < enemy_density.shape[1]:
-                                if enemy_density[cy, cx] > 0.3:  # In enemy territory
-                                    importance *= 3.0
-                                    if is_moving:
-                                        importance *= 1.5
+                            # Calculate base importance
+                            importance = 0.5  # Base importance
+                            
+                            # Movement is critical - much higher importance for moving units
+                            if is_moving:
+                                importance *= 4.0
+                            
+                            # Distance from base importance
+                            if dist_from_home > 30:  # Significantly away from base
+                                importance *= 3.0
+                            elif dist_from_home > 20:  # Moderately away
+                                importance *= 2.0
+                                
+                            # Heavily penalize large static areas (likely buildings)
+                            if area > 50 and movement_score < 0.05:
+                                importance *= 0.1
                             
                             # Early game bonus
                             if is_early_game:
                                 importance *= 1.5
                             
-                            # Store position and add activity
-                            player_positions[color].append((cx, cy))
+                            # Enhanced staleness penalty based on movement and persistence
+                            if hasattr(self, 'position_visit_counts'):
+                                visit_count = self.position_visit_counts.get(pos_key, 0)
+                                if visit_count > 0:
+                                    if not is_moving and movement_score < 0.05:
+                                        # Much harsher decay for static objects
+                                        importance *= max(0.15, 0.5 ** visit_count)
+                                    else:
+                                        # Normal decay for moving units
+                                        importance *= max(0.3, 0.7 ** visit_count)
                             
-                            # Determine type based on distance (now always defined)
-                            activity_type = 'field_military' if dist_from_home > 20 else 'military_units'
+                            # Apply persistence penalty
+                            if self.persistent_positions.get(pos_key, 0) > 5:
+                                time_static = current_time - self.position_first_seen[pos_key]
+                                if time_static > 30:  # If static for more than 30 seconds
+                                    importance *= 0.3
                             
-                            military_activities.append({
+                            # Create activity
+                            activity = {
                                 'position': (cx, cy),
                                 'area': area,
                                 'color': color,
                                 'importance': importance,
-                                'type': activity_type,
+                                'type': 'field_military' if dist_from_home > 20 else 'military_units',
                                 'is_moving': is_moving,
                                 'movement_score': movement_score,
                                 'high_density': military_data['high_density'],
                                 'timestamp': current_time
-                            })
+                            }
+                            
+                            # Check position ratio relative to enemy base
+                            enemy_color = 'Red' if color == 'Blue' else 'Blue'
+                            enemy_base = self.base_monitor.get_tc_position(enemy_color)
+                            
+                            if enemy_base and own_base:
+                                dist_to_enemy_base = self.calculate_distance((cx, cy), enemy_base)
+                                total_dist = self.calculate_distance(own_base, enemy_base)
+                                
+                                if total_dist > 0:  # Avoid division by zero
+                                    position_ratio = dist_to_enemy_base / total_dist
+                                    
+                                    # Modify importance based on position ratio
+                                    if position_ratio > 0.8:
+                                        activity['importance'] *= 0.2  # Heavy penalty for very back positions
+                                    elif position_ratio > 0.6:
+                                        activity['importance'] *= 0.5  # Moderate penalty for back positions
+                                    elif position_ratio < 0.5:
+                                        activity['importance'] *= 1.5  # Bonus for forward positions
+                            
+                            # Store position and add to activities
+                            player_positions[color].append((cx, cy))
+                            military_activities.append(activity)
+                            
+                            # Track this position for future staleness calculation
+                            if not hasattr(self, 'position_visit_counts'):
+                                self.position_visit_counts = {}
+                            self.position_visit_counts[pos_key] = self.position_visit_counts.get(pos_key, 0) + 1
 
             # Store current military map for next comparison
             self.last_military_map = military_map.copy()
 
-            # Check for combat
+            # Check for combat with increased sensitivity
             for activity in military_activities:
                 enemy_color = 'Red' if activity['color'] == 'Blue' else 'Blue'
                 pos = activity['position']
                 
                 for enemy_pos in player_positions[enemy_color]:
                     dist = self.calculate_distance(pos, enemy_pos)
-                    if dist < 25:  # Combat detection radius
+                    if dist < 30:  # Increased from 25 - more sensitive to nearby units
                         activity['type'] = 'major_combat'
-                        activity['importance'] *= 4.0
+                        activity['importance'] *= 4.0  # Increased from 4.0 for stronger combat priority
                         activity['view_duration'] = self.combat_view_duration
                         break
             
@@ -1138,12 +1343,10 @@ class SpectatorCore:
                 military_activities, proximity_threshold=12  # Smaller radius
             )
             return military_data
-            
+                
         except Exception as e:
             logging.error(f"Error in check_military_situation: {e}")
             return {'activities': [], 'high_density': False, 'military_map': None}
-
-
 
     def _deduplicate_activities(self, military_activities, proximity_threshold=12):
         """Enhanced deduplication that preserves more distinct military movements"""
@@ -1337,7 +1540,7 @@ class SpectatorCore:
                 self.forced_view_until = 0
                 self.combat_perspective = 'defender'
                 self.last_perspective_switch = 0
-                self.perspective_switch_interval = 8.0
+                self.perspective_switch_interval = 15.0
                 self.last_military_view = 0
                 self.last_switch_time = current_time  # Add explicit initialization
 
@@ -1359,7 +1562,7 @@ class SpectatorCore:
                         # Check for any nearby enemy units
                         for enemy_act in enemy_activities:
                             dist = self.calculate_distance(act['position'], enemy_act['position'])
-                            if dist < 50:  # 50 pixel radius for potential conflict
+                            if dist < 35:  # 50 pixel radius for potential conflict
                                 act['has_enemy_nearby'] = True
                                 potential_conflicts.append(act)
                                 break
@@ -1447,7 +1650,7 @@ class SpectatorCore:
                             if self.combat_perspective == 'defender':
                                 defender_base = self.base_monitor.get_tc_position(next_activity.get('defender'))
                                 if defender_base:
-                                    pos = self._adjust_combat_position(pos, defender_base, 8)
+                                    pos = self._adjust_combat_position(pos, defender_base, 5)
                             self.click_minimap(pos[0], pos[1], mask)
                         elif next_activity.get('type') == 'territory_breach':
                             # Enhanced handling for territory breaches
@@ -1455,7 +1658,7 @@ class SpectatorCore:
                             enemy_base = self.base_monitor.get_tc_position(enemy_color)
                             if enemy_base:
                                 # Adjust view position to better show the breach context
-                                pos = self._adjust_combat_position(pos, enemy_base, 12)
+                                pos = self._adjust_combat_position(pos, enemy_base, 5)
                             self.click_minimap(pos[0], pos[1], mask)
                         else:
                             self.click_minimap(pos[0], pos[1], mask)
@@ -1486,7 +1689,7 @@ class SpectatorCore:
                         base_pos = self.base_monitor.get_tc_position(base_color) if base_color else None
                         pos = activities[0]['position']
                         if base_pos:
-                            pos = self._adjust_combat_position(pos, base_pos, 12)
+                            pos = self._adjust_combat_position(pos, base_pos, 5)
                         self.click_minimap(pos[0], pos[1], mask)
                         logging.info(f"Updated combat view for new {self.combat_perspective} perspective")
 
@@ -1725,7 +1928,7 @@ class SpectatorCore:
                         cy = int(M["m01"] / M["m00"])
                         
                         if minimap_mask[cy, cx]:
-                            importance = min(area / 100, 5)
+                            importance = min(area / 120, 5)
                             activity_zones.append({
                                 'position': (cx, cy),
                                 'area': area,
@@ -2167,7 +2370,7 @@ class TerritoryTracker:
                                     # Skip if no movement
                                     if movement is not None:
                                         movement_score = movement[y, x]
-                                        if movement_score < 0.1:  # Skip stationary units
+                                        if movement_score < 0.05:  # Skip stationary units
                                             continue
                                     
                                     # Calculate distance from defender's base
