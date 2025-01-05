@@ -7,6 +7,7 @@ from PIL import ImageGrab
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from typing import Optional, Dict, Tuple
+from obs_control import create_obs_manager
 
 from autospectate.spectator_core import SpectatorCore
 from autospectate.web_automation import find_and_spectate_game
@@ -38,6 +39,9 @@ class MainFlow:
         # Initialize state
         self.spectator_core = None
         self.current_game_start = None
+        self.capture_age_title = "CaptureAge"
+        self.initial_game_wait = 180  # 3 minutes wait before switching to CaptureAge
+        self.obs_manager = create_obs_manager()
 
     def setup_logging(self):
         """Set up logging configuration."""
@@ -77,6 +81,57 @@ class MainFlow:
         
         logging.error("Game load timeout exceeded")
         return False
+
+
+
+    def start_continuous_stream(self):
+        """Start the continuous streaming process."""
+        try:
+            if not self.obs_manager.connect():
+                logging.error("Failed to connect to OBS")
+                return False
+
+            self.obs_manager.switch_scene(self.obs_manager.scenes['GOING_LIVE'])
+            if not self.obs_manager.is_streaming():
+                self.obs_manager.start_stream()
+
+            return True
+        except Exception as e:
+            logging.error(f"Error starting continuous stream: {e}")
+            return False
+
+    def handle_game_cycle(self, match_info):
+        """Handle a single game cycle."""
+        try:
+            if not switch_to_window(self.game_window_title):
+                return False
+
+            if not self.wait_for_game_load():
+                return False
+
+            logging.info("Waiting 3 minutes before switching to CaptureAge...")
+            time.sleep(self.initial_game_wait)
+
+            if not switch_to_window(self.capture_age_title):
+                return False
+
+            if not self.force_player_colors():
+                return False
+
+            self.obs_manager.switch_scene(self.obs_manager.scenes['GAME'])
+            self.obs_manager.update_game_source(f"{self.capture_age_title}:Chrome_WidgetWin_1:CaptureAge.exe")
+
+            self.spectator_core = SpectatorCore(self.config)
+            self.current_game_start = time.time()
+            
+            while not self.spectator_core.detect_game_over():
+                self.spectator_core.run_spectator_iteration()
+                time.sleep(0.5)
+
+            return True
+        except Exception as e:
+            logging.error(f"Error in game cycle: {e}")
+            return False
 
     def adjust_game_view(self):
         """Adjust game view settings (ALT+D, ALT+F)."""
@@ -264,12 +319,15 @@ class MainFlow:
             return False
 
     def main_loop(self):
-        """Main application loop."""
+        """Main continuous streaming loop."""
+        if not self.start_continuous_stream():
+            return
+
         while True:
             try:
-                logging.info("Starting new game cycle")
-                
-                # Find and spectate game
+                self.obs_manager.switch_scene(self.obs_manager.scenes['GOING_LIVE'])
+                logging.info("Looking for new game...")
+
                 with sync_playwright() as playwright:
                     spectated, match_info = find_and_spectate_game(
                         playwright, 
@@ -280,34 +338,21 @@ class MainFlow:
                         logging.warning("No game found to spectate. Waiting before retry...")
                         time.sleep(60)
                         continue
-                
-                # Switch to game window
-                if not switch_to_window(self.game_window_title):
-                    logging.error("Failed to switch to game window")
-                    continue
-                
-                # Wait for game to load
-                if not self.wait_for_game_load():
-                    continue
-                
-                # Adjust view settings
-                if not self.adjust_game_view():
-                    continue
-                
-                # Force player colors
-                if not self.force_player_colors():
-                    continue
-                
-                # Run spectator
-                if not self.run_spectator():
-                    continue
-                
-                logging.info("Game cycle completed successfully")
+
+                self.handle_game_cycle(match_info)
+
+                self.obs_manager.switch_scene(self.obs_manager.scenes['GOING_LIVE'])
+                logging.info(f"Waiting {self.between_games_delay} seconds before next game...")
                 time.sleep(self.between_games_delay)
-                
+
             except Exception as e:
                 logging.error(f"Error in main loop: {e}")
                 time.sleep(10)
+            finally:
+                try:
+                    self.obs_manager.switch_scene(self.obs_manager.scenes['GOING_LIVE'])
+                except:
+                    pass
 
 def main():
     """Entry point."""
