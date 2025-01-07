@@ -48,6 +48,9 @@ class MainFlow:
         # Initialize state
         self.spectator_core = None
         self.current_game_start = None
+        self.capture_age_title = "CaptureAge"
+        self.initial_game_wait = 180  # 3 minutes wait before switching to CaptureAge
+        self.obs_manager = create_obs_manager()
 
     def setup_logging(self):
         """Set up logging configuration."""
