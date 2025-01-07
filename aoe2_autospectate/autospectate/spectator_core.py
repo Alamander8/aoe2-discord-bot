@@ -247,6 +247,18 @@ class BaseMonitor:
         pass
 
 
+# Import all needed modules at the top
+import time
+import cv2
+import numpy as np
+from PIL import ImageGrab
+import pyautogui
+import logging
+import random
+from collections import deque
+from typing import Dict, List, Tuple, Optional
+from threading import Lock 
+
 class SpectatorCore:
     def __init__(self, config):
         # Basic configuration
@@ -267,17 +279,17 @@ class SpectatorCore:
         self.military_check_interval = 8.0
         self.recent_visits = []
         self.last_density_map = None
-        self.last_expansion_check={
+        self.last_expansion_check = {
             'Blue': 0,
             'Red': 0
         }
         self.max_expansion_importance = 2.0 
 
-        #initialize
+        # Initialize
         self.base_monitor = BaseMonitor(self)
         
-        # Color configuration
-        self.player_colors_config = config.PLAYER_HSV_RANGES
+        # Color configuration - get from passed config object
+        self.player_colors_config = getattr(config, 'PLAYER_HSV_RANGES', {})
         
         # Activity thresholds
         self.min_activity_area = 40
@@ -289,18 +301,22 @@ class SpectatorCore:
         self.combat_view_duration = 10.0
         self.last_switch_time = time.time()
         self.last_visit_times = {
-        'Blue': {'military': 0, 'economy': 0},
-        'Red': {'military': 0, 'economy': 0}
-    }
+            'Blue': {'military': 0, 'economy': 0},
+            'Red': {'military': 0, 'economy': 0}
+        }
         
-
         # Previous frame storage for movement detection
         self.prev_frame = None
         self.movement_weight = 0.7  # Moderate boost for movement
         self.static_weight = 0.2  # Still significant weight for static elements
 
-        # Initialize territory tracker and viewing queue
-        self.territory_tracker = TerritoryTracker()
+        # Initialize territory tracker with building parameters from config
+        building_params = {
+            'min_area': getattr(config, 'BUILDING_ICON_MIN_AREA', 15),
+            'max_area': getattr(config, 'BUILDING_ICON_MAX_AREA', 50),
+            'min_circularity': getattr(config, 'BUILDING_ICON_MIN_CIRCULARITY', 0.6)
+        }
+        self.territory_tracker = TerritoryTracker(building_params)
         self.viewing_queue = ViewingQueue(min_revisit_time=3.0, proximity_radius=50)
         
         # Active colors for 1v1
@@ -1507,14 +1523,18 @@ class SpectatorCore:
         logging.info("Starting spectator")
         try:
             while True:
-                self.run_spectator_iteration()
+                iteration_result = self.run_spectator_iteration()
+                if not iteration_result:  # Game has ended
+                    logging.info("Game has ended, exiting spectator loop")
+                    return True  # Clean exit - game ended normally
                 time.sleep(0.5)  # Prevent excessive CPU usage
-                
+                    
         except KeyboardInterrupt:
             logging.info("Spectator stopped by user")
+            return False
         except Exception as e:
             logging.error(f"Error in spectator loop: {e}")
-            time.sleep(1)
+            return False
 
     def run_spectator_iteration(self):
         """Run a single iteration of the spectator logic."""
@@ -2092,7 +2112,7 @@ class SpectatorCore:
 
 
 class TerritoryTracker:
-    def __init__(self):
+    def __init__(self, building_params=None):
         """Initialize the territory tracker with updated parameters."""
         self.territories = {}
         self.heat_map = None
@@ -2110,6 +2130,16 @@ class TerritoryTracker:
         # Parameters for clustering
         self.cluster_distance = 25
         self.detection_radius = 30
+        
+        # Building parameters from config (or defaults)
+        if building_params:
+            self.BUILDING_ICON_MIN_AREA = building_params.get('min_area', 15)
+            self.BUILDING_ICON_MAX_AREA = building_params.get('max_area', 50)
+            self.BUILDING_ICON_MIN_CIRCULARITY = building_params.get('min_circularity', 0.6)
+        else:
+            self.BUILDING_ICON_MIN_AREA = 15
+            self.BUILDING_ICON_MAX_AREA = 50
+            self.BUILDING_ICON_MIN_CIRCULARITY = 0.6
         
         # Raid tracking
         self.raid_history = {}
