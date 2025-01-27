@@ -9,6 +9,8 @@ from collections import deque
 from typing import Dict, List, Tuple, Optional
 from threading import Lock 
 import math
+from betting_bridge import BettingBridge 
+import requests
 
 class ViewingQueue:
     def __init__(self, min_revisit_time: float = 4.0, proximity_radius: int = 50):
@@ -23,7 +25,7 @@ class ViewingQueue:
         self.staleness_threshold = 2  # Number of views before applying staleness
         self.base_visit_interval = 45.0  # Seconds between forced base checks
         self.max_view_count = 5
-        self.staleness_penalty = 0.6
+        self.staleness_penalty = 0.7
 
     def add_zone(self, zone: dict) -> None:
         if self._is_new_area(zone['position']):
@@ -247,20 +249,10 @@ class BaseMonitor:
         pass
 
 
-# Import all needed modules at the top
-import time
-import cv2
-import numpy as np
-from PIL import ImageGrab
-import pyautogui
-import logging
-import random
-from collections import deque
-from typing import Dict, List, Tuple, Optional
-from threading import Lock 
+
 
 class SpectatorCore:
-    def __init__(self, config):
+    def __init__(self, config, betting_bridge=None):
         # Basic configuration
         self.config = config
         self.minimap_x = config.MINIMAP_X
@@ -284,6 +276,9 @@ class SpectatorCore:
             'Red': 0
         }
         self.max_expansion_importance = 2.0 
+
+        # betting
+        self.betting_bridge = betting_bridge
 
         # Initialize
         self.base_monitor = BaseMonitor(self)
@@ -427,7 +422,7 @@ class SpectatorCore:
                     activity['importance'] *= (1.0 + (len(nearby_enemies) * 0.3))
                     if len(nearby_enemies) >= 2:
                         activity['type'] = 'potential_engagement'
-                        activity['importance'] *= 1.5
+                        activity['importance'] *= 1.7
                 
                 # Combat detection
                 closest_enemy = min([self.calculate_distance(activity['position'], e['position']) 
@@ -448,7 +443,7 @@ class SpectatorCore:
                     activity['view_duration'] = self.combat_view_duration
                 elif closest_enemy < 35:  # New tier for nearby units
                     activity['type'] = 'potential_combat'
-                    activity['importance'] *= 2.5
+                    activity['importance'] *= 2.6
                 
                 # Movement bonus
                 if activity.get('is_moving', False):
@@ -460,7 +455,7 @@ class SpectatorCore:
                             enemy_base[1] - activity['position'][1]
                         )
                         if vector_to_enemy[0] * vector_to_enemy[0] + vector_to_enemy[1] * vector_to_enemy[1] > 0:
-                            activity['importance'] *= 1.5  # Extra boost if moving toward enemy
+                            activity['importance'] *= 1.6  # Extra boost if moving toward enemy
                 
                 # Time balance factor
                 time_since_military = current_time - self.last_visit_times[activity['color']]['military']
@@ -992,10 +987,10 @@ class SpectatorCore:
         
         # Heavy bonus for being away from home base
         # Start scaling up at 50 pixels, max bonus at 150 pixels
-        distance_multiplier = min(4.0, max(1.0, dist_from_home / 35))
+        distance_multiplier = min(4.0, max(1.0, dist_from_home / 25))
         
         # Movement is very important
-        movement_multiplier = 3.5 if is_moving else 0.15
+        movement_multiplier = 4.0 if is_moving else 0.2
         
         # Check if in enemy territory
         enemy_color = 'Red' if color == 'Blue' else 'Blue'
@@ -1008,7 +1003,7 @@ class SpectatorCore:
                 territory_control = enemy_density[y, x]
                 
                 # Get average control in surrounding area
-                area_size = 4
+                area_size = 8
                 x_start = max(0, x - area_size)
                 x_end = min(enemy_density.shape[1], x + area_size)
                 y_start = max(0, y - area_size)
@@ -1022,7 +1017,7 @@ class SpectatorCore:
                 
                 # Additional boost if in contested area (both players have presence)
                 if area_control > 0.3 and area_control < 0.7:
-                    territory_multiplier *= 1.3
+                    territory_multiplier *= 1.5
         
         # Static position penalty for large areas (likely buildings)
         if area > 20 and not is_moving:  # TC/Castle sized
@@ -1349,9 +1344,9 @@ class SpectatorCore:
                 
                 for enemy_pos in player_positions[enemy_color]:
                     dist = self.calculate_distance(pos, enemy_pos)
-                    if dist < 30:  # Increased from 25 - more sensitive to nearby units
+                    if dist < 35:  # Increased from 25 - more sensitive to nearby units
                         activity['type'] = 'major_combat'
-                        activity['importance'] *= 4.0  # Increased from 4.0 for stronger combat priority
+                        activity['importance'] *= 4.5  # Increased from 4.0 for stronger combat priority
                         activity['view_duration'] = self.combat_view_duration
                         break
             
@@ -1522,13 +1517,21 @@ class SpectatorCore:
         """Main spectator loop."""
         logging.info("Starting spectator")
         try:
+            # Trigger betting start
+            if self.betting_bridge:
+                self.betting_bridge.on_game_start()
+                
             while True:
                 iteration_result = self.run_spectator_iteration()
                 if not iteration_result:  # Game has ended
+                    # Get winner before cleanup
+                    winner = self.determine_winner()
+                    if winner and self.betting_bridge:
+                        self.betting_bridge.on_game_end(winner)
                     logging.info("Game has ended, exiting spectator loop")
                     return True  # Clean exit - game ended normally
                 time.sleep(0.5)  # Prevent excessive CPU usage
-                    
+                        
         except KeyboardInterrupt:
             logging.info("Spectator stopped by user")
             return False
@@ -1540,7 +1543,10 @@ class SpectatorCore:
         """Run a single iteration of the spectator logic."""
         try:
             if self.detect_game_over():
-                logging.info("Game has ended, stopping spectator")
+                winner = self.determine_winner()
+                if winner and hasattr(self, 'betting_bridge') and self.betting_bridge:
+                    self.betting_bridge.on_game_end(winner)
+                logging.info(f"Game ended with winner: {winner}")
                 return False
 
             current_time = time.time()
@@ -1816,6 +1822,13 @@ class SpectatorCore:
         try:
             current_time = time.time()
             
+            if not hasattr(self, 'game_start_time'):
+                self.game_start_time = current_time
+                return False
+
+            if current_time - self.game_start_time < 180: 
+                return False
+
             # Calculate resource area coordinates (same as before)
             left_bbox = (
                 self.game_area_x + 210,
@@ -1860,7 +1873,7 @@ class SpectatorCore:
             # Add new snapshot
             self.resource_history.append((left_array, right_array))
             
-            # Keep only last 5 snapshots (20 seconds worth)
+            # Keep only last 5 snapshots (32 seconds worth)
             if len(self.resource_history) > 5:
                 self.resource_history.pop(0)
             
@@ -1907,14 +1920,64 @@ class SpectatorCore:
                 # If no significant changes detected over 20 seconds (5 snapshots)
                 if all_similar:
                     logging.info("Game over detected - Resources static for 20 seconds")
+                    
+                    winner = self.determine_winner()
+                    if winner:
+                        logging.info(f"Winner detected: {winner}")
+                        if hasattr(self, 'betting_bridge') and self.betting_bridge:
+                            self.betting_bridge.on_game_end(winner)
                     return True
-            
+                                
             return False
 
         except Exception as e:
             logging.error(f"Error in game over detection: {e}")
             return False
     
+    def determine_winner(self):
+        """Detect winner by analyzing victory screen text"""
+        try:
+            victory_box = (
+                800,   # X start
+                120,   # Y start 
+                1120,  # X end
+                300    # Y end
+            )
+            
+            screenshot = ImageGrab.grab(bbox=victory_box)
+            frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2HSV)
+            
+            blue_text = cv2.inRange(frame, 
+                np.array([100, 150, 200]), 
+                np.array([140, 255, 255])
+            )
+            
+            red_text = cv2.inRange(frame, 
+                np.array([0, 150, 200]), 
+                np.array([10, 255, 255])
+            )
+            
+            if self.debug_mode:
+                cv2.imwrite('debug_final_victory.png', 
+                        cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR))
+            
+            blue_pixels = np.sum(blue_text > 0)
+            red_pixels = np.sum(red_text > 0)
+            
+            threshold = 100  # Minimum pixels to consider valid
+            
+            if blue_pixels > threshold and blue_pixels > red_pixels:
+                return 'Blue'
+            elif red_pixels > threshold and red_pixels > blue_pixels:
+                return 'Red'
+                
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error determining winner: {e}")
+            return None
+
+
     def detect_activity_zones(self, minimap_image, minimap_mask, specific_color=None):
         """Detect activity zones with mask support."""
         activity_zones = []

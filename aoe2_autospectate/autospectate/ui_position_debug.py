@@ -342,3 +342,39 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+    def check_color(self, x, y, target_color):
+        """Check if pixel at (x,y) is the target color."""
+        try:
+            bbox = (x - 5, y - 5, x + 5, y + 5)
+            screenshot = ImageGrab.grab(bbox=bbox)
+            img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2HSV)
+
+            if target_color == 'blue':
+                # Further refined blue color range
+                lower = np.array([100, 120, 180])  # Adjusted for brighter, saturated blue
+                upper = np.array([140, 255, 255])
+            else:  # red
+                # Further refined and expanded red color range
+                lower1 = np.array([0, 150, 120])    # Lower end of red hue
+                upper1 = np.array([10, 255, 255])
+                lower2 = np.array([170, 150, 120])  # Upper end of red hue
+                upper2 = np.array([180, 255, 255])
+
+                # Create masks for both hue ranges
+                mask1 = cv2.inRange(img, lower1, upper1)
+                mask2 = cv2.inRange(img, lower2, upper2)
+
+                # Combine masks
+                mask = cv2.bitwise_or(mask1, mask2)
+
+            mask = cv2.inRange(img, lower, upper) if target_color == 'blue' else mask
+            result = np.any(mask)
+            logging.info(f"Color check for {target_color}: {'Found' if result else 'Not found'}")
+            return result
+        except Exception as e:
+            logging.error(f"Error checking color: {e}")
+            return False
