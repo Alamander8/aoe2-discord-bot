@@ -8,6 +8,7 @@ import logging
 import random
 import os
 import shutil
+from civ_manager import CivilizationManager
 
 @dataclass
 class Bet:
@@ -41,6 +42,7 @@ class BettingBot(commands.Bot):
         self.points_file = 'user_points.json'
         self.user_points = self.load_points()
         self._tasks = set()
+        self.civ_manager = CivilizationManager()
         self.betting_pool = None
         logging.info(f"BettingBot initialized for channel: {channel}")
 
@@ -122,6 +124,17 @@ class BettingBot(commands.Bot):
             f"Betting is now open for {duration} seconds! House bets {house_blue} on Blue and {house_red} on Red. Use !bet <amount> blue/red"
         )
         
+
+        # Schedule 30-second warning
+        await asyncio.sleep(duration - 30)
+        if self.betting_pool and self.betting_pool.is_active:
+            total_pool = self.betting_pool.total_blue + self.betting_pool.total_red
+            await self.get_channel(self.channel).send(
+                f"⚠️ 30 SECONDS LEFT TO BET! Current pool: {total_pool} 🧂 (Blue: {self.betting_pool.total_blue}, Red: {self.betting_pool.total_red})"
+            )
+
+
+
         await asyncio.sleep(duration)
         await self.close_betting()
         return True
@@ -180,7 +193,10 @@ class BettingBot(commands.Bot):
         else:
             # Give random amount between 40 and 200
             claim_amount = random.randint(40, 200)
+            if civ := self.civ_manager.get_user_civ(user_id):
+                claim_amount = int(claim_amount * civ.pound_multiplier)
             self.user_points[user_id] += claim_amount
+            display_name = self.civ_manager.get_display_name(ctx.author.name, user_id)
             await ctx.send(f"@{ctx.author.name} You claimed {claim_amount} pounds of salt! You now have {self.user_points[user_id]} total!")
 
         # Update cooldown and save
@@ -321,10 +337,120 @@ class BettingBot(commands.Bot):
     async def help_command(self, ctx):
         """Show available commands"""
         help_text = (
-            "Available commands:\n"
-            "!pound - Get your starting salt (500)\n"
-            "!bet <amount> <blue/red> - Place a bet (bet open for 3 min after spec starts)\n"
-            "!salt - Check how many pounds of salt you have\n"
-            "!help - Show this message"
+            "🎲 Available Commands 🎲\n"
+            "!pound - Claim salt (30 min cooldown)\n"
+            "!bet <amount> <blue/red> - Place a bet\n"
+            "!salt - Check your salt balance\n"
+            "!pool - View current betting pool\n"
+            "!mybets - View your active bets\n"
+            "!leaderboard - View top 5 salt holders\n"
+            "\n🏰 Civilization Commands 🏰\n"
+            "!civs - See available civilizations\n"
+            "!civ <name> - Select a civilization (200 salt)\n"
+            "!myciv - View your current civilization\n"
+            "\n!help - Show this message"
         )
         await ctx.send(help_text)
+
+    @commands.command(name='pool')
+    async def pool_command(self, ctx):
+        """Show current betting pool information"""
+        if not hasattr(self, 'betting_pool') or not self.betting_pool or not self.betting_pool.is_active:
+            await ctx.send("No active betting pool!")
+            return
+            
+        total_pool = self.betting_pool.total_blue + self.betting_pool.total_red
+        blue_odds = (total_pool / self.betting_pool.total_blue) if self.betting_pool.total_blue > 0 else 0
+        red_odds = (total_pool / self.betting_pool.total_red) if self.betting_pool.total_red > 0 else 0
+        
+        await ctx.send(
+            f"Current Pool: {total_pool} 🧂 | "
+            f"Blue: {self.betting_pool.total_blue} (x{blue_odds:.2f}) | "
+            f"Red: {self.betting_pool.total_red} (x{red_odds:.2f})"
+        )
+
+    @commands.command(name='mybets')
+    async def mybets_command(self, ctx):
+        """Show user's active bets"""
+        user_id = str(ctx.author.id)
+        if not hasattr(self, 'betting_pool') or not self.betting_pool:
+            await ctx.send("No active betting pool!")
+            return
+            
+        user_bet = self.betting_pool.bets.get(user_id)
+        if user_bet:
+            await ctx.send(
+                f"@{ctx.author.name} has bet {user_bet.amount} 🧂 on {user_bet.team}"
+            )
+        else:
+            await ctx.send(f"@{ctx.author.name} has no active bets")
+
+    @commands.command(name='leaderboard')
+    async def leaderboard_command(self, ctx):
+        """Show top 5 salt holders"""
+        sorted_users = sorted(
+            self.user_points.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )[:5]
+        
+        leaderboard = "🏆 Salt Leaderboard 🏆\n"
+        for i, (user_id, points) in enumerate(sorted_users, 1):
+            username = await self._get_username(user_id)
+            leaderboard += f"{i}. {username}: {points} 🧂\n"
+        
+        await ctx.send(leaderboard)
+
+
+    @commands.command(name='civs')
+    async def civs_command(self, ctx):
+        """Show available civilizations"""
+        await ctx.send(self.civ_manager.format_civ_list())
+
+    @commands.command(name='civ')
+    async def civ_command(self, ctx, civilization: str = None):
+        """Select or view civilization"""
+        user_id = str(ctx.author.id)
+        
+        # If no civ specified, show current civ
+        if not civilization:
+            current_civ = self.civ_manager.get_user_civ(user_id)
+            if current_civ:
+                await ctx.send(f"@{ctx.author.name} You are playing as {current_civ.name} {current_civ.badge}")
+            else:
+                await ctx.send(f"@{ctx.author.name} You haven't selected a civilization yet. Use !civs to see options")
+            return
+
+        # Check if user already has a civ
+        current_civ = self.civ_manager.get_user_civ(user_id)
+        cost = 1000 if current_civ else 200  # Switch cost vs initial cost
+        
+        # Check if user has enough salt
+        if self.user_points.get(user_id, 0) < cost:
+            await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch civilizations' if current_civ else 'select a civilization'}")
+            return
+
+        # Try to select civilization
+        success, message = self.civ_manager.select_civilization(user_id, civilization)
+        if success:
+            # Deduct salt
+            self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
+            await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
+            self.save_points()
+        else:
+            await ctx.send(f"@{ctx.author.name} {message}")
+
+    @commands.command(name='myciv')
+    async def myciv_command(self, ctx):
+        """Show detailed information about your civilization"""
+        user_id = str(ctx.author.id)
+        civ = self.civ_manager.get_user_civ(user_id)
+        
+        if not civ:
+            await ctx.send(f"@{ctx.author.name} You haven't selected a civilization yet. Use !civs to see options")
+            return
+
+        await ctx.send(
+            f"@{ctx.author.name} Civilization: {civ.badge} {civ.name}\n"
+            f"Bonus: {civ.description}"
+        )

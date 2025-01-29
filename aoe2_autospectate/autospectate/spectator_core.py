@@ -1751,13 +1751,21 @@ class SpectatorCore:
             x2 = self.minimap_x + self.minimap_width
             y2 = self.minimap_y + self.minimap_height
             
-            screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-            frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+            screenshot = None 
+            frame = None 
+            try:
+                screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+                frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+                return frame
+            finally:
+                #explicit cleanup
+                if screenshot:
+                    screenshot.close()
+                    #let frame be garbage collected since its being returned
             
             if self.debug_mode:
                 cv2.imwrite('debug_raw_minimap.png', frame)
                 
-            return frame
         except Exception as e:
             logging.error(f"Error capturing minimap: {e}")
             return None
@@ -2089,14 +2097,19 @@ class SpectatorCore:
         current_time = time.time()
         
         if hasattr(self, '_cached_military_map'):
-            if current_time - self._last_military_cache < 5.0:  # Cache valid for 5 seconds
-                return self._cached_military_map
+            if current_time - self._last_military_cache > 5.0:
+                del self._cached_military_map
+                del self._last_military_cache
+                
+        if hasattr(self, '_cached_military_map'):  # Cache valid for 5 seconds
+            return self._cached_military_map
         
         with self.minimap_lock:
             self.toggle_military_view()
             time.sleep(0.2)
             military_map = self.capture_minimap()
             self.toggle_military_view()
+            time.sleep(0.2)
             self.toggle_military_view()
             
             if military_map is not None:
@@ -2237,6 +2250,13 @@ class TerritoryTracker:
             
         self.last_update = current_time
         
+
+        # Clear old prev_frames periodically
+        if len(self.prev_frame) > 2:  # Keep only recent frames
+            old_keys = list(self.prev_frame.keys())[:-2]  # Keep last 2
+            for key in old_keys:
+                del self.prev_frame[key]
+
         # Initialize heat map with mask consideration
         if minimap_mask is not None:
             self.heat_map = np.zeros_like(minimap_image[:,:,0], dtype=float)
