@@ -16,11 +16,10 @@ from health_check import HealthCheck
 from recovery import RecoveryManager
 from spectator_core import SpectatorCore
 from web_automation import find_and_spectate_game
-from windows_management import switch_to_window
 from utils import setup_logging, capture_screen
 from obs_control import create_obs_manager
 from betting_bridge import BettingBridge
-
+from windows_management import * 
 class MainFlow:
     def __init__(self, config):
         """Initialize the main flow controller."""
@@ -353,34 +352,57 @@ class MainFlow:
             return False
 
     def handle_game_end(self) -> bool:
-            """Handle game end cleanup sequence."""
-            logging.info("Game ended, starting cleanup")
+        """Handle game end cleanup with programmatic window management."""
+        try:
+            logging.info("Starting game end cleanup sequence")
             
-            # Single scene switch attempt at the start
-            scene_switched = self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
-            
-            if not scene_switched:
-                logging.error("Failed to switch scene to FindingGame")
-            
-            # Clear text regardless of scene switch
+            # Step 1: Switch OBS scene first
+            self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
+            time.sleep(1)
+
+            # Step 2: Clear match text (non-critical)
             try:
                 self.obs_manager.clear_match_text()
             except Exception as e:
                 logging.warning(f"Non-critical error clearing match text: {e}")
 
-            # Game cleanup with retries
-            attempts = 0
-            max_attempts = 5
-            while attempts < max_attempts:
-                if switch_to_window("Age of Empires II: Definitive Edition"):
-                    logging.info("Successfully switched to Age of Empires II: DE window")
-                    if self.cleanup_game_window():
-                        return True
-                attempts += 1
-                time.sleep(2)
+            # Step 3: Ensure AoE2 window focus
+            aoe2_window = "Age of Empires II: Definitive Edition"
             
-            logging.error("Failed to complete game end cleanup")
+            if not ensure_window_focus(aoe2_window):
+                logging.error("Failed to focus AoE2 window")
+                return False
+                
+            # Step 4: Send menu navigation commands
+            time.sleep(1)  # Wait for window to be ready
+            logging.info("Sending menu navigation commands")
+            
+            # First sequence
+            pyautogui.press('tab')
+            time.sleep(1.0)
+            pyautogui.press('enter')
+            time.sleep(1.5)
+            
+            # Second sequence
+            pyautogui.press('esc')
+            time.sleep(1.0)
+            pyautogui.press('enter')
+            time.sleep(1.5)
+            
+            # Final sequence
+            pyautogui.press('esc')
+            time.sleep(1.0)
+            pyautogui.press('esc')
+            time.sleep(2.0)
+            
+            logging.info("Game end cleanup completed successfully")
+            return True
+                
+        except Exception as e:
+            logging.error(f"Error during game end cleanup: {e}")
             return False
+
+
 
     def run_spectator(self) -> bool:
         """Initialize and run the spectator core."""
@@ -470,6 +492,8 @@ class MainFlow:
                             self.state_manager.transition_to(GameState.GAME_FOUND)
 
                     elif current_state == GameState.GAME_FOUND:
+                        logging.info("Game found, minimizing AoE II window during load...")
+
                         if self.wait_for_game_load():
                             self.state_manager.transition_to(GameState.LOADING_GAME)
 

@@ -27,6 +27,7 @@ class BettingPool:
     start_time: float
     end_time: Optional[float]
 
+
 class BettingBot(commands.Bot):
     def __init__(self, token: str, channel: str):
         token = token.replace('oauth:', '')
@@ -133,9 +134,7 @@ class BettingBot(commands.Bot):
                 f"⚠️ 30 SECONDS LEFT TO BET! Current pool: {total_pool} 🧂 (Blue: {self.betting_pool.total_blue}, Red: {self.betting_pool.total_red})"
             )
 
-
-
-        await asyncio.sleep(duration)
+        await asyncio.sleep(30)
         await self.close_betting()
         return True
 
@@ -178,11 +177,16 @@ class BettingBot(commands.Bot):
         user_id = str(ctx.author.id)
         current_time = time.time()
         
-        # Check cooldown
+        # Get modified cooldown if user has a unit type
+        modified_cooldown = self.claim_cooldown_time
+        if civ := self.civ_manager.get_user_civ(user_id):
+            modified_cooldown = self.claim_cooldown_time * civ.pound_cooldown_multiplier
+        
+        # Check cooldown with modified time
         if user_id in self.claim_cooldowns:
             time_since_last = current_time - self.claim_cooldowns[user_id]
-            if time_since_last < self.claim_cooldown_time:
-                minutes_left = int((self.claim_cooldown_time - time_since_last) / 60)
+            if time_since_last < modified_cooldown:
+                minutes_left = int((modified_cooldown - time_since_last) / 60)
                 await ctx.send(f"@{ctx.author.name} You can claim more salt in {minutes_left} minutes!")
                 return
 
@@ -296,29 +300,50 @@ class BettingBot(commands.Bot):
         if winning_pool == 0:
             return False
 
-        # Group all winners first
-        winning_bets = [bet for bet in self.betting_pool.bets.values() if bet.team == winner]
+        # Track round results
+        self.last_round_results = []
         
-        # Send a single summary message first
+        # Process winners
+        winning_bets = [bet for bet in self.betting_pool.bets.values() 
+                    if bet.team == winner and not bet.user_id.startswith('house_')]
+        
         if winning_bets:
             await self.get_channel(self.channel).send(f"Results for {winner} victory:")
         
-        # Process each winner
         for bet in winning_bets:
             share = bet.amount / winning_pool
             winnings = bet.amount + int(losing_pool * share)
+            profit = winnings - bet.amount
             
             # Update points
             self.user_points[bet.user_id] = self.user_points.get(bet.user_id, 0) + winnings
             
-            # Single announcement per winner
+            # Track result
+            self.last_round_results.append({
+                'username': bet.username,
+                'profit': profit,
+                'bet_amount': bet.amount
+            })
+            
             await self.get_channel(self.channel).send(
-                f"@{bet.username} won {winnings} pounds! (Bet: {bet.amount}, Bonus: {int(losing_pool * share)})"
+                f"@{bet.username} won {winnings:,} pounds! "
+                f"(Bet: {bet.amount:,}, Bonus: +{int(losing_pool * share):,})"
             )
+        
+        # Track losers
+        losing_bets = [bet for bet in self.betting_pool.bets.values() 
+                    if bet.team != winner and not bet.user_id.startswith('house_')]
+        
+        for bet in losing_bets:
+            self.last_round_results.append({
+                'username': bet.username,
+                'profit': -bet.amount,
+                'bet_amount': bet.amount
+            })
 
         # Save updated points
         self.save_points()
-        self.betting_pool = None  # Clear betting pool after resolution
+        self.betting_pool = None
         return True
 
 
@@ -335,103 +360,214 @@ class BettingBot(commands.Bot):
 
     @commands.command(name='help')
     async def help_command(self, ctx):
-        """Show available commands"""
-        help_text = (
-            "🎲 Available Commands 🎲\n"
-            "!pound - Claim salt (30 min cooldown)\n"
-            "!bet <amount> <blue/red> - Place a bet\n"
-            "!salt - Check your salt balance\n"
-            "!pool - View current betting pool\n"
-            "!mybets - View your active bets\n"
-            "!leaderboard - View top 5 salt holders\n"
-            "\n🏰 Civilization Commands 🏰\n"
-            "!civs - See available civilizations\n"
-            "!civ <name> - Select a civilization (200 salt)\n"
-            "!myciv - View your current civilization\n"
-            "\n!help - Show this message"
-        )
-        await ctx.send(help_text)
+        """Show available commands in Twitch-friendly format"""
+        
+        # Core betting commands (most used)
+        await ctx.send("BETTING: !bet <amount> <blue/red> to place bet · !mybet to see your bet · !pool to see odds")
+        
+        # Stats and results
+        await ctx.send("RESULTS: !winners to see biggest wins · !losers to see biggest losses · !leaderboard for top salt holders")
+        
+        # Salt management
+        await ctx.send("SALT: !pound to get salt (30m cooldown) · !salt to check balance")
+        
+        # Unit system
+        await ctx.send("UNITS: !units to see types · !unit <type> to pick · !profile to check your unit")
 
+        
     @commands.command(name='pool')
     async def pool_command(self, ctx):
         """Show current betting pool information"""
-        if not hasattr(self, 'betting_pool') or not self.betting_pool or not self.betting_pool.is_active:
-            await ctx.send("No active betting pool!")
-            return
-            
-        total_pool = self.betting_pool.total_blue + self.betting_pool.total_red
-        blue_odds = (total_pool / self.betting_pool.total_blue) if self.betting_pool.total_blue > 0 else 0
-        red_odds = (total_pool / self.betting_pool.total_red) if self.betting_pool.total_red > 0 else 0
-        
-        await ctx.send(
-            f"Current Pool: {total_pool} 🧂 | "
-            f"Blue: {self.betting_pool.total_blue} (x{blue_odds:.2f}) | "
-            f"Red: {self.betting_pool.total_red} (x{red_odds:.2f})"
-        )
-
-    @commands.command(name='mybets')
-    async def mybets_command(self, ctx):
-        """Show user's active bets"""
-        user_id = str(ctx.author.id)
         if not hasattr(self, 'betting_pool') or not self.betting_pool:
             await ctx.send("No active betting pool!")
             return
-            
+        
+        total_pool = self.betting_pool.total_blue + self.betting_pool.total_red
+        
+        # Prevent division by zero
+        blue_odds = (total_pool / self.betting_pool.total_blue) if self.betting_pool.total_blue > 0 else 0
+        red_odds = (total_pool / self.betting_pool.total_red) if self.betting_pool.total_red > 0 else 0
+        
+        # Count unique betters per side (excluding house)
+        blue_betters = sum(1 for bet in self.betting_pool.bets.values() 
+                        if bet.team == 'Blue' and not bet.user_id.startswith('house_'))
+        red_betters = sum(1 for bet in self.betting_pool.bets.values() 
+                        if bet.team == 'Red' and not bet.user_id.startswith('house_'))
+        
+        await ctx.send(
+            f"Current Pool: {total_pool:,} 🧂\n"
+            f"Blue: {self.betting_pool.total_blue:,} (x{blue_odds:.2f}) [{blue_betters} betters]\n"
+            f"Red: {self.betting_pool.total_red:,} (x{red_odds:.2f}) [{red_betters} betters]"
+        )
+
+
+    @commands.command(name='mybet')
+    async def mybet_command(self, ctx):
+        """Show user's current bet"""
+        user_id = str(ctx.author.id)
+        
+        if not hasattr(self, 'betting_pool') or not self.betting_pool:
+            await ctx.send("No active betting pool!")
+            return
+        
         user_bet = self.betting_pool.bets.get(user_id)
         if user_bet:
+            # Calculate potential winnings
+            total_pool = self.betting_pool.total_blue + self.betting_pool.total_red
+            team_pool = (self.betting_pool.total_blue 
+                        if user_bet.team == 'Blue' 
+                        else self.betting_pool.total_red)
+            
+            potential_share = (user_bet.amount / team_pool) if team_pool > 0 else 0
+            potential_winnings = user_bet.amount + int((total_pool - team_pool) * potential_share)
+            
             await ctx.send(
-                f"@{ctx.author.name} has bet {user_bet.amount} 🧂 on {user_bet.team}"
+                f"@{ctx.author.name} Your bet: {user_bet.amount:,} 🧂 on {user_bet.team}\n"
+                f"Potential win: {potential_winnings:,} 🧂 "
+                f"(+{potential_winnings - user_bet.amount:,})"
             )
         else:
-            await ctx.send(f"@{ctx.author.name} has no active bets")
+            await ctx.send(f"@{ctx.author.name} You haven't placed a bet this round")
 
     @commands.command(name='leaderboard')
     async def leaderboard_command(self, ctx):
-        """Show top 5 salt holders"""
+        """Show top 4 salt holders, excluding house accounts"""
+        # Filter out house accounts and sort by value
+        player_totals = {
+            user_id: amount 
+            for user_id, amount in self.user_points.items() 
+            if not user_id.startswith('house_')
+        }
+        
         sorted_users = sorted(
-            self.user_points.items(), 
-            key=lambda x: x[1], 
+            player_totals.items(),
+            key=lambda x: x[1],
             reverse=True
-        )[:5]
+        )[:4]
         
-        leaderboard = "🏆 Salt Leaderboard 🏆\n"
-        for i, (user_id, points) in enumerate(sorted_users, 1):
-            username = await self._get_username(user_id)
-            leaderboard += f"{i}. {username}: {points} 🧂\n"
+        if not sorted_users:
+            await ctx.send("No salt holders yet!")
+            return
         
-        await ctx.send(leaderboard)
+        entries = []
+        medals = ["🥇", "🥈", "🥉", "🏅"]  # Medals for top 4
+        
+        for i, (user_id, amount) in enumerate(sorted_users):
+            entries.append(f"{medals[i]} {amount:,} 🧂")
+        
+        await ctx.send("TOP SALT TOTALS:\n" + "\n".join(entries))
 
 
-    @commands.command(name='civs')
+
+
+    @commands.command(name='winners')
+    async def winners_command(self, ctx):
+        """Show biggest winners from last betting round"""
+        if not hasattr(self, 'last_round_results'):
+            await ctx.send("No completed betting rounds yet!")
+            return
+        
+        sorted_winners = sorted(
+            self.last_round_results,
+            key=lambda x: x['profit'],
+            reverse=True
+        )[:3]
+        
+        if not sorted_winners:
+            await ctx.send("No winners from last round!")
+            return
+        
+        entries = []
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for i, result in enumerate(sorted_winners):
+            if result['profit'] > 0:  # Only show actual winners
+                entries.append(
+                    f"{medals[i]} {result['username']}: +{result['profit']:,} 🧂"
+                )
+        
+        if entries:
+            await ctx.send("BIGGEST WINNERS:\n" + "\n".join(entries))
+        else:
+            await ctx.send("No winners last round!")
+
+    @commands.command(name='losers')
+    async def losers_command(self, ctx):
+        """Show biggest losers from last betting round"""
+        if not hasattr(self, 'last_round_results'):
+            await ctx.send("No completed betting rounds yet!")
+            return
+        
+        sorted_losers = sorted(
+            self.last_round_results,
+            key=lambda x: x['profit']
+        )[:3]  # Ascending order for biggest losses
+        
+        if not sorted_losers:
+            await ctx.send("No results from last round!")
+            return
+        
+        entries = []
+        medals = ["💀", "☠️", "👻"]  # Funny emojis for losers
+        
+        for i, result in enumerate(sorted_losers):
+            if result['profit'] < 0:  # Only show actual losers
+                entries.append(
+                    f"{medals[i]} {result['username']}: {result['profit']:,} 🧂"
+                )
+        
+        if entries:
+            await ctx.send("BIGGEST LOSSES:\n" + "\n".join(entries))
+        else:
+            await ctx.send("No losses last round!")
+
+
+
+
+
+    @commands.command(name='units')
     async def civs_command(self, ctx):
-        """Show available civilizations"""
-        await ctx.send(self.civ_manager.format_civ_list())
+        """Show available unit specializations"""
+        basic_info = "⚔️ AVAILABLE UNITS (200 salt to pick) ⚔️"
+        
+        unit_list = (
+            f"{self.civ_manager.CIVILIZATIONS['archer'].badge} Archer: +30% !pound rewards\n"
+            f"{self.civ_manager.CIVILIZATIONS['infantry'].badge} Infantry: 40% faster !pound cooldown\n"
+            f"{self.civ_manager.CIVILIZATIONS['cavalry'].badge} Cavalry: Double rewards, 50% longer cooldown\n"
+            f"{self.civ_manager.CIVILIZATIONS['eagle'].badge} Eagle: 30% cheaper techs"
+        )
 
-    @commands.command(name='civ')
-    async def civ_command(self, ctx, civilization: str = None):
-        """Select or view civilization"""
+        await ctx.send(basic_info)
+        await ctx.send(unit_list)
+
+    @commands.command(name='unit')
+    async def civ_command(self, ctx, unit_type: str = None):
+        """Select or view unit type"""
         user_id = str(ctx.author.id)
         
-        # If no civ specified, show current civ
-        if not civilization:
-            current_civ = self.civ_manager.get_user_civ(user_id)
-            if current_civ:
-                await ctx.send(f"@{ctx.author.name} You are playing as {current_civ.name} {current_civ.badge}")
+        # If no unit specified, show current unit
+        if not unit_type:
+            current_unit = self.civ_manager.get_user_civ(user_id)
+            if current_unit:
+                await ctx.send(f"@{ctx.author.name} You are specialized in {current_unit.name} {current_unit.badge}")
             else:
-                await ctx.send(f"@{ctx.author.name} You haven't selected a civilization yet. Use !civs to see options")
+                await ctx.send(f"@{ctx.author.name} You haven't selected a unit type yet. Use !units to see options")
             return
 
-        # Check if user already has a civ
-        current_civ = self.civ_manager.get_user_civ(user_id)
-        cost = 1000 if current_civ else 200  # Switch cost vs initial cost
+        # Force lowercase for consistency with our stored values
+        unit_type = unit_type.lower()
+
+        # Check if user already has a unit type
+        current_unit = self.civ_manager.get_user_civ(user_id)
+        cost = 1000 if current_unit else 200  # Switch cost vs initial cost
         
         # Check if user has enough salt
         if self.user_points.get(user_id, 0) < cost:
-            await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch civilizations' if current_civ else 'select a civilization'}")
+            await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch unit type' if current_unit else 'select a unit type'}")
             return
 
-        # Try to select civilization
-        success, message = self.civ_manager.select_civilization(user_id, civilization)
+        # Try to select unit type
+        success, message = self.civ_manager.select_civilization(user_id, unit_type)
         if success:
             # Deduct salt
             self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
@@ -440,17 +576,36 @@ class BettingBot(commands.Bot):
         else:
             await ctx.send(f"@{ctx.author.name} {message}")
 
-    @commands.command(name='myciv')
+            # Check if user already has a civ
+            current_civ = self.civ_manager.get_user_civ(user_id)
+            cost = 1000 if current_civ else 200  # Switch cost vs initial cost
+            
+            # Check if user has enough salt
+            if self.user_points.get(user_id, 0) < cost:
+                await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch civilizations' if current_civ else 'select a civilization'}")
+                return
+
+            # Try to select civilization
+            success, message = self.civ_manager.select_civilization(user_id, civilization)
+            if success:
+                # Deduct salt
+                self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
+                await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
+                self.save_points()
+            else:
+                await ctx.send(f"@{ctx.author.name} {message}")
+
+    @commands.command(name='profile')
     async def myciv_command(self, ctx):
         """Show detailed information about your civilization"""
         user_id = str(ctx.author.id)
         civ = self.civ_manager.get_user_civ(user_id)
         
         if not civ:
-            await ctx.send(f"@{ctx.author.name} You haven't selected a civilization yet. Use !civs to see options")
+            await ctx.send(f"@{ctx.author.name} You haven't selected a Unit type yet. Use !units to see options")
             return
 
         await ctx.send(
-            f"@{ctx.author.name} Civilization: {civ.badge} {civ.name}\n"
+            f"@{ctx.author.name} UnitType: {civ.badge} {civ.name}\n"
             f"Bonus: {civ.description}"
         )

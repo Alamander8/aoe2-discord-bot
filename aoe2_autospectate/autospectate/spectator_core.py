@@ -28,6 +28,17 @@ class ViewingQueue:
         self.staleness_penalty = 0.7
 
     def add_zone(self, zone: dict) -> None:
+        current_time = time.time()
+
+        # Cap view_counts if it grows too large (100 positions)
+        if len(self.view_counts) > 100:
+            logging.info(f"Capping view_counts from {len(self.view_counts)} positions")
+            self.view_counts = dict(sorted(
+                self.view_counts.items(), 
+                key=lambda x: self.viewed_positions.get(x[0], 0),
+                reverse=True
+            )[:100])
+
         if self._is_new_area(zone['position']):
             pos_key = f"{zone['position'][0]},{zone['position'][1]}"
             view_count = self.view_counts.get(pos_key, 0)
@@ -47,7 +58,7 @@ class ViewingQueue:
             # Cap view count to prevent integer overflow
             if self.view_counts[pos_key] > self.max_view_count:
                 self.view_counts[pos_key] = self.max_view_count
-
+    
     def get_current_view(self) -> Optional[dict]:
         """Get the currently viewed zone without removing it from queue"""
         return self.queue[0] if self.queue else None
@@ -369,6 +380,127 @@ class SpectatorCore:
                     break  # Only add one fallback view at a time
 
 
+
+
+    def get_area_brightness(self, minimap_image, position, radius=15):
+        """Calculate average brightness of an area around a position"""
+        try:
+            # Convert to HSV
+            hsv = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
+            
+            # Extract Value channel (brightness)
+            value_channel = hsv[:, :, 2]
+            
+            # Define region around position
+            x, y = position
+            y_start = max(0, y - radius)
+            y_end = min(value_channel.shape[0], y + radius)
+            x_start = max(0, x - radius)
+            x_end = min(value_channel.shape[1], x + radius)
+            
+            # Get average brightness of region
+            region = value_channel[y_start:y_end, x_start:x_end]
+            avg_brightness = np.mean(region)
+            
+            # Normalize to 0-1
+            return avg_brightness / 255.0
+            
+        except Exception as e:
+            logging.error(f"Error calculating area brightness: {e}")
+            return 0.5  # Default to middle brightness on error
+
+    def adjust_importance_for_brightness(self, activity, minimap_image):
+        """Adjust activity importance based on area brightness"""
+        brightness = self.get_area_brightness(minimap_image, activity['position'])
+        
+        # Create steep dropoff for dark areas (fog of war, water)
+        # This function heavily penalizes dark areas while being more lenient to medium-bright areas
+        brightness_multiplier = np.power(brightness, 1.5)  # Steeper than linear dropoff
+        
+        # Additional penalty for very dark areas (likely water/fog)
+        if brightness < 0.3:  # Very dark
+            brightness_multiplier *= 0.3
+        
+        # Don't completely zero out importance, but reduce it significantly for dark areas
+        adjusted_importance = activity['importance'] * max(0.1, brightness_multiplier)
+        
+        if self.debug_mode and adjusted_importance < activity['importance'] * 0.5:
+            logging.debug(f"Significant brightness penalty at {activity['position']}: "
+                        f"brightness={brightness:.2f}, multiplier={brightness_multiplier:.2f}")
+        
+        return adjusted_importance
+
+
+
+
+    def get_minimap_visibility(self, minimap_image, position, radius=5):
+        """
+        Calculate if an area on the minimap is in explored territory.
+        Uses a smaller radius since we're working with minimap scale.
+        """
+        try:
+            # Convert to HSV
+            hsv = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
+            
+            # Get both Saturation and Value channels
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+            
+            # Define region around position (smaller for minimap)
+            x, y = position
+            y_start = max(0, y - radius)
+            y_end = min(value.shape[0], y + radius)
+            x_start = max(0, x - radius)
+            x_end = min(value.shape[1], x + radius)
+            
+            # Get region stats
+            region_sat = saturation[y_start:y_end, x_start:x_end]
+            region_val = value[y_start:y_end, x_start:x_end]
+            
+            # Characteristics of unexplored/water areas:
+            # - Low saturation (grayed out)
+            # - Low to medium value (darker)
+            avg_sat = np.mean(region_sat)
+            avg_val = np.mean(region_val)
+            
+            # Combined visibility score (0-1)
+            # Higher weight on saturation as it's a better indicator of explored vs unexplored
+            visibility = (0.7 * (avg_sat / 255.0) + 0.3 * (avg_val / 255.0))
+            
+            if self.debug_mode:
+                if visibility < 0.3:
+                    logging.debug(f"Low visibility area detected at {position}: {visibility:.2f}")
+                    cv2.circle(self.last_minimap, (x, y), radius, (0, 0, 255), 1)  # Mark dark areas
+            
+            return visibility
+            
+        except Exception as e:
+            logging.error(f"Error calculating minimap visibility: {e}")
+            return 0.5  # Default to middle visibility on error
+
+    def adjust_importance_for_visibility(self, activity, minimap_image):
+        """Adjust activity importance based on minimap visibility"""
+        visibility = self.get_minimap_visibility(minimap_image, activity['position'])
+        
+        # Sharp dropoff for unexplored/water areas
+        if visibility < 0.3:  # Clearly unexplored or water
+            visibility_multiplier = 0.2
+        elif visibility < 0.5:  # Partially visible
+            visibility_multiplier = 0.6
+        else:  # Well explored area
+            visibility_multiplier = 1.0
+        
+        # Don't modify importance for certain high-priority activities
+        if activity.get('type') in ['major_combat', 'territory_breach']:
+            return activity['importance']  # Keep original importance for critical events
+        
+        return activity['importance'] * visibility_multiplier
+
+
+
+
+
+
     def decide_next_view(self, curr_minimap, mask, military_mode=False):
         """
         Enhanced view decision making with better economic activity integration
@@ -572,6 +704,10 @@ class SpectatorCore:
             # Fallback views if needed
             if not all_activities:
                 self.add_fallback_views(all_activities, current_time)
+
+            for activity in all_activities:
+                if self.is_point_in_minimap(activity['position'][0], activity['position'][1], mask):
+                    activity['importance'] = self.adjust_importance_for_visibility(activity, curr_minimap)
 
             # Sort and deduplicate activities
             all_activities.sort(key=lambda x: x['importance'], reverse=True)
@@ -1136,10 +1272,14 @@ class SpectatorCore:
             
             # Clean up old persistent position tracking
             if hasattr(self, 'position_first_seen'):
-                for pos_key in list(self.position_first_seen.keys()):
-                    if current_time - self.position_first_seen[pos_key] > 120:  # 2 minutes
-                        del self.position_first_seen[pos_key]
-                        del self.persistent_positions[pos_key]
+                self.position_first_seen = {
+                    k: v for k, v in self.position_first_seen.items() 
+                    if current_time - v < 60  # 1 minute
+                }
+                self.persistent_positions = {
+                    k: v for k, v in self.persistent_positions.items()
+                    if k in self.position_first_seen
+                }
 
             # Get military map with caching
             if not military_mode:
@@ -1513,6 +1653,48 @@ class SpectatorCore:
                 pass
             return []
 
+
+
+    def check_game_end(self):
+        """Check for game end screen every 10 seconds"""
+        try:
+            current_time = time.time()
+            
+            # Initialize last check time if needed
+            if not hasattr(self, 'last_end_check'):
+                self.last_end_check = current_time
+                return None
+                
+            # Don't check for first 3 minutes of game
+            if not hasattr(self, 'game_start_time'):
+                self.game_start_time = current_time
+                return None
+                
+            if current_time - self.game_start_time < 60:
+                return None
+
+            # Only check every 10 seconds
+            if current_time - self.last_end_check < 10.0:
+                return None
+                
+            self.last_end_check = current_time
+            
+            # Check for winner screen
+            winner = self.determine_winner()
+            if winner:
+                logging.info(f"Game end detected with winner: {winner}")
+                return winner
+                
+            return None
+
+        except Exception as e:
+            logging.error(f"Error checking game end: {e}")
+            return None
+
+
+
+
+
     def run_spectator(self):
         """Main spectator loop."""
         logging.info("Starting spectator")
@@ -1524,14 +1706,10 @@ class SpectatorCore:
             while True:
                 iteration_result = self.run_spectator_iteration()
                 if not iteration_result:  # Game has ended
-                    # Get winner before cleanup
-                    winner = self.determine_winner()
-                    if winner and self.betting_bridge:
-                        self.betting_bridge.on_game_end(winner)
                     logging.info("Game has ended, exiting spectator loop")
                     return True  # Clean exit - game ended normally
                 time.sleep(0.5)  # Prevent excessive CPU usage
-                        
+                            
         except KeyboardInterrupt:
             logging.info("Spectator stopped by user")
             return False
@@ -1543,10 +1721,11 @@ class SpectatorCore:
         """Run a single iteration of the spectator logic."""
         try:
             if self.detect_game_over():
-                winner = self.determine_winner()
-                if winner and hasattr(self, 'betting_bridge') and self.betting_bridge:
-                    self.betting_bridge.on_game_end(winner)
-                logging.info(f"Game ended with winner: {winner}")
+                if hasattr(self, 'betting_bridge') and self.betting_bridge:
+                    winner = self.determine_winner()
+                    if winner:
+                        self.betting_bridge.on_game_end(winner)
+                logging.info("Game ended normally")
                 return False
 
             current_time = time.time()
@@ -1826,7 +2005,7 @@ class SpectatorCore:
 
 
     def detect_game_over(self):
-        """Detect game end by monitoring resource numbers for changes."""
+        """Detect game end using resource changes and victory screen verification."""
         try:
             current_time = time.time()
             
@@ -1834,10 +2013,11 @@ class SpectatorCore:
                 self.game_start_time = current_time
                 return False
 
+            # Don't check for first 3 minutes
             if current_time - self.game_start_time < 180: 
                 return False
 
-            # Calculate resource area coordinates (same as before)
+            # Calculate resource area coordinates
             left_bbox = (
                 self.game_area_x + 210,
                 self.game_area_y + 1,
@@ -1856,14 +2036,9 @@ class SpectatorCore:
             left_resources = ImageGrab.grab(bbox=left_bbox)
             right_resources = ImageGrab.grab(bbox=right_bbox)
             
-            # Convert to grayscale numpy arrays to reduce noise
+            # Convert to grayscale numpy arrays
             left_array = cv2.cvtColor(np.array(left_resources), cv2.COLOR_RGB2GRAY)
             right_array = cv2.cvtColor(np.array(right_resources), cv2.COLOR_RGB2GRAY)
-            
-            # Save debug images if debug mode is enabled
-            if self.debug_mode:
-                cv2.imwrite('debug_left_gray.png', left_array)
-                cv2.imwrite('debug_right_gray.png', right_array)
             
             # Initialize tracking if needed
             if not hasattr(self, 'resource_history'):
@@ -1875,76 +2050,53 @@ class SpectatorCore:
             # Only check every 4 seconds
             if current_time - self.last_resource_check < 4.0:
                 return False
-            
+                
             self.last_resource_check = current_time
             
             # Add new snapshot
             self.resource_history.append((left_array, right_array))
             
-            # Keep only last 5 snapshots (32 seconds worth)
+            # Keep only last 5 snapshots (20 seconds worth)
             if len(self.resource_history) > 5:
                 self.resource_history.pop(0)
             
             # If we have enough history, check for changes
             if len(self.resource_history) == 5:
                 all_similar = True
-                max_left_diff = 0
-                max_right_diff = 0
                 
                 # Compare each consecutive pair
                 for i in range(len(self.resource_history) - 1):
                     prev_left, prev_right = self.resource_history[i]
                     curr_left, curr_right = self.resource_history[i + 1]
                     
-                    # Calculate mean absolute difference
                     left_diff = np.mean(cv2.absdiff(prev_left, curr_left))
                     right_diff = np.mean(cv2.absdiff(prev_right, curr_right))
                     
-                    max_left_diff = max(max_left_diff, left_diff)
-                    max_right_diff = max(max_right_diff, right_diff)
-                    
                     # Allow for small differences (noise threshold)
-                    if left_diff > 1.0 or right_diff > 1.0:  # Adjust threshold as needed
+                    if left_diff > 1.0 or right_diff > 1.0:
                         all_similar = False
-                        if self.debug_mode:
-                            logging.info(f"Detected changes - Left diff: {left_diff:.2f}, Right diff: {right_diff:.2f}")
                         break
-                
-                if self.debug_mode:
-                    logging.info(f"Max differences - Left: {max_left_diff:.2f}, Right: {max_right_diff:.2f}")
-                    
-                    if all_similar:
-                        # Save comparison images
-                        cv2.imwrite('debug_last_left.png', self.resource_history[-1][0])
-                        cv2.imwrite('debug_last_right.png', self.resource_history[-1][1])
-                        
-                        # Save difference visualization
-                        if len(self.resource_history) >= 2:
-                            diff_left = cv2.absdiff(self.resource_history[-1][0], self.resource_history[-2][0])
-                            diff_right = cv2.absdiff(self.resource_history[-1][1], self.resource_history[-2][1])
-                            cv2.imwrite('debug_diff_left.png', diff_left)
-                            cv2.imwrite('debug_diff_right.png', diff_right)
-                
-                # If no significant changes detected over 20 seconds (5 snapshots)
+
+                # If resources are static, verify with victory screen
                 if all_similar:
-                    logging.info("Game over detected - Resources static for 20 seconds")
-                    
                     winner = self.determine_winner()
                     if winner:
-                        logging.info(f"Winner detected: {winner}")
-                        if hasattr(self, 'betting_bridge') and self.betting_bridge:
-                            self.betting_bridge.on_game_end(winner)
-                    return True
-                                
-            return False
+                        logging.info(f"Game end confirmed with winner: {winner}")
+                        return True
+                    else:
+                        logging.info("Static resources detected but no victory screen - continuing game")
+                        self.resource_history = []  # Reset history for next check
+                        
+                return False
 
         except Exception as e:
             logging.error(f"Error in game over detection: {e}")
             return False
-    
+
     def determine_winner(self):
-        """Detect winner by analyzing victory screen text"""
+        """Detect winner by analyzing victory screen text and layout"""
         try:
+            # Capture larger area to include both player name and "is victorious!" text
             victory_box = (
                 800,   # X start
                 120,   # Y start 
@@ -1955,12 +2107,26 @@ class SpectatorCore:
             screenshot = ImageGrab.grab(bbox=victory_box)
             frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2HSV)
             
-            blue_text = cv2.inRange(frame, 
+            # Convert to HSV for better color detection
+            hsv = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2HSV)
+
+            # Check for victory text presence first ("is victorious!")
+            # Converting to grayscale for text detection
+            gray = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+            _, victory_text = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            
+            # If we don't see bright text that would indicate "is victorious!", return None
+            if np.sum(victory_text > 0) < 1000:  # Adjust threshold as needed
+                logging.info("No victory text detected - likely not a game end screen")
+                return None
+
+            # Now check for colored player name
+            blue_mask = cv2.inRange(hsv, 
                 np.array([100, 150, 200]), 
                 np.array([140, 255, 255])
             )
             
-            red_text = cv2.inRange(frame, 
+            red_mask = cv2.inRange(hsv, 
                 np.array([0, 150, 200]), 
                 np.array([10, 255, 255])
             )
@@ -1968,19 +2134,23 @@ class SpectatorCore:
             if self.debug_mode:
                 cv2.imwrite('debug_final_victory.png', 
                         cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR))
+                cv2.imwrite('debug_victory_text.png', victory_text)
+                cv2.imwrite('debug_blue_mask.png', blue_mask)
+                cv2.imwrite('debug_red_mask.png', red_mask)
             
-            blue_pixels = np.sum(blue_text > 0)
-            red_pixels = np.sum(red_text > 0)
+            blue_pixels = np.sum(blue_mask > 0)
+            red_pixels = np.sum(red_mask > 0)
             
-            threshold = 100  # Minimum pixels to consider valid
-            
-            if blue_pixels > threshold and blue_pixels > red_pixels:
+            # Require both color presence and reasonable pixel counts
+            color_threshold = 100  # Minimum pixels for color detection
+            if blue_pixels > color_threshold and blue_pixels > red_pixels * 1.5:
                 return 'Blue'
-            elif red_pixels > threshold and red_pixels > blue_pixels:
+            elif red_pixels > color_threshold and red_pixels > blue_pixels * 1.5:
                 return 'Red'
-                
+                    
+            logging.info("No clear winner color detected")
             return None
-            
+                
         except Exception as e:
             logging.error(f"Error determining winner: {e}")
             return None
@@ -2434,6 +2604,10 @@ class TerritoryTracker:
             if not hasattr(self, 'prev_frame'):
                 self.prev_frame = {}
             
+            # cleanup - only keep blue and red
+            self.prev_frame = {k: v for k in ['Blue', 'Red'] if k in self.prev_frame}
+
+
             for attacker in self.territories:
                 for defender in self.territories:
                     if attacker != defender:
@@ -2596,16 +2770,12 @@ class TerritoryTracker:
 
 
     def cleanup_raid_history(self, current_time):
-        """Remove old raid records."""
-        cleanup_threshold = current_time - (self.staleness_threshold * 2)
-        keys_to_remove = []
-        
-        for raid_key, history in self.raid_history.items():
-            if history['last_update'] < cleanup_threshold:
-                keys_to_remove.append(raid_key)
-        
-        for key in keys_to_remove:
-            del self.raid_history[key]
+        """Remove old raid records with more aggressive cleanup."""
+        # Clean up anything older than 10 seconds
+        self.raid_history = {
+            k: v for k, v in self.raid_history.items()
+            if current_time - v['last_update'] < 10.0
+        }
 
     def calculate_raid_importance(self, position, attacker_density, defender_density, movement_map=None, radius=30):
         """Calculate raid importance with enhanced movement priority"""

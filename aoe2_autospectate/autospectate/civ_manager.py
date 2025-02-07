@@ -15,50 +15,30 @@ class CivilizationBonus:
 
 class CivilizationManager:
     CIVILIZATIONS = {
-    'incan': CivilizationBonus(
-        name="Incan",
-        description="!pound rewards increased by 15%, 5% tech cost reduction",
-        badge="🏔️",
-        pound_multiplier=1.15,
-        cost_reduction=0.95
-    ),
-    'briton': CivilizationBonus(
-        name="Briton",
-        description="+25% to all !pound rewards",
+    'archer': CivilizationBonus(
+        name="Archer",
+        description="+30% to !pound rewards",
         badge="🏹",
-        pound_multiplier=1.25
+        pound_multiplier=1.30
     ),
-    'persian': CivilizationBonus(
-        name="Persian",
-        description="10% to all !pound rewards, 10% shorter pound CD ",
-        badge="🐘",
+    'infantry': CivilizationBonus(
+        name="Infantry",
+        description="!pound cooldown reduced by 40%",
+        badge="⚔️",
+        pound_cooldown_multiplier=0.60
+    ),
+    'cavalry': CivilizationBonus(
+        name="Cavalry",
+        description="Double !pound rewards but 50% longer cooldown",
+        badge="🐎",
         pound_multiplier=2.0,
-        pound_cooldown_multiplier=0.90
+        pound_cooldown_multiplier=1.50
     ),
-    'chinese': CivilizationBonus(
-        name="Chinese",
+    'eagle': CivilizationBonus(
+        name="Eagle",
         description="Technologies cost 30% less",
-        badge="🐉",
+        badge="🦅",
         cost_reduction=0.70
-    ),
-    'japanese': CivilizationBonus(
-        name="Japanese",
-        description="!pound cooldown reduced by 30%",
-        badge="⛩️",
-        pound_cooldown_multiplier=0.70
-    ),
-    'malay': CivilizationBonus(
-        name="Malay",
-        description="Age ups cost 40% less",
-        badge="⛵",
-        cost_reduction=0.60  # For age ups only
-    ),
-    'teuton': CivilizationBonus(
-        name="Teuton",
-        description="+10% to !pound rewards and technologies cost 15% less",
-        badge="🏰",
-        pound_multiplier=1.10,
-        cost_reduction=0.85
     )
 }
 
@@ -82,14 +62,14 @@ class CivilizationManager:
 
     def select_civilization(self, user_id: str, civ_name: str) -> tuple[bool, str]:
         """Select a civilization for a user"""
-        civ_name = civ_name.lower()
+        civ_name = civ_name.lower()  # Force lowercase
         if civ_name not in self.CIVILIZATIONS:
-            return False, f"Invalid civilization. Use !civs to see available options."
+            return False, f"Invalid unit type. Use !units to see available options."
 
-        self.user_civilizations[user_id] = civ_name
+        self.user_civilizations[user_id] = civ_name  # Store as lowercase
         self.save_data()
         civ = self.CIVILIZATIONS[civ_name]
-        return True, f"You are now playing as {civ.name} {civ.badge}"
+        return True, f"You are now specialized in {civ.name} {civ.badge}"
 
     def get_user_civ(self, user_id: str) -> Optional[CivilizationBonus]:
         """Get a user's civilization bonus"""
