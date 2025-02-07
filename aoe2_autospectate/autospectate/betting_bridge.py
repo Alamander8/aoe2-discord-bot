@@ -10,12 +10,12 @@ class BettingBridge:
     def __init__(self, channel: str):
         logging.info("Initializing BettingBridge...")
         self.channel = channel.lower()
-        self.token = "oupa8z2646y8al78slb32indxg2lyw"
+        self.token = "TOKEN"
         
         # Test token validity
         headers = {
             'Authorization': f'Bearer {self.token}',
-            'Client-Id': 'gp762nuuoqcoxypju8c569th9wz7q5'
+            'Client-Id': 'CLIENTID'
         }
         try:
             response = requests.get('https://id.twitch.tv/oauth2/validate', headers=headers)
@@ -86,12 +86,12 @@ class BettingBridge:
     def __init__(self, channel: str):
         logging.info("Initializing BettingBridge...")
         self.channel = channel.lower()  # Convert to lowercase
-        self.token = "oupa8z2646y8al78slb32indxg2lyw"
+        self.token = "TOKEN"
         
         # Test token validity
         headers = {
             'Authorization': f'Bearer {self.token}',
-            'Client-Id': 'gp762nuuoqcoxypju8c569th9wz7q5'  # Client ID from token generator
+            'Client-Id': 'CLIENTID'  # Client ID from token generator
         }
         try:
             response = requests.get('https://id.twitch.tv/oauth2/validate', headers=headers)

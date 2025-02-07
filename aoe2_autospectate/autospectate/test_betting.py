@@ -14,7 +14,7 @@ class MockContext:
         logging.info(f"Bot response: {content}")
 
 async def simulate_betting_round():
-    bot = BettingBot(token="oupa8z2646y8al78slb32indxg2lyw", channel="saltyempires")
+    bot = BettingBot(token="token", channel="saltyempires")
     bot_task = asyncio.create_task(bot.start())
     await asyncio.sleep(2)
     
