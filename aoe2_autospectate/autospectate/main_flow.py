@@ -20,6 +20,11 @@ from utils import setup_logging, capture_screen
 from obs_control import create_obs_manager
 from betting_bridge import BettingBridge
 from windows_management import * 
+from windows_management import switch_to_captureage
+
+
+
+
 class MainFlow:
     def __init__(self, config):
         """Initialize the main flow controller."""
@@ -57,10 +62,10 @@ class MainFlow:
         }
         
         # Timeouts and delays
-        self.game_load_timeout = 130  # 2 minutes + 10 seconds
+        self.game_load_timeout = 130  # 120 seconds + 10 seconds
         self.color_check_interval = 3  # 3 seconds between checks
         self.force_color_max_attempts = 10
-        self.between_games_delay = 60  # 1 minute
+        self.between_games_delay = 10  # 1 minute
         
         # Initialize state
         self.spectator_core = SpectatorCore(config, betting_bridge=self.betting_bridge)
@@ -190,26 +195,35 @@ class MainFlow:
         try:
             logging.info("Setting up game view...")
             
-            # Set default orientation
-            logging.info("Setting default orientation (Alt+D)")
-            pyautogui.hotkey('alt', 'd')
-            time.sleep(0.5)
+            # Small initial delay to ensure window is ready
+            time.sleep(0.2)
             
-            # Set fixed camera
-            logging.info("Setting fixed camera (Alt+F)")
-            pyautogui.hotkey('alt', 'f')
-            time.sleep(0.5)
+            # Use individual key presses instead of hotkeys to avoid Alt focus issues
+            pyautogui.keyDown('alt')
+            time.sleep(0.1)
+            pyautogui.press('d')
+            time.sleep(0.1)
+            pyautogui.keyUp('alt')
+            time.sleep(0.3)
+            
+            pyautogui.keyDown('alt')
+            time.sleep(0.1)
+            pyautogui.press('f')
+            time.sleep(0.1)
+            pyautogui.keyUp('alt')
+            time.sleep(0.3)
             
             # Set zoom level
-            logging.info("Setting zoom level (3)")
             pyautogui.press('3')
-            time.sleep(0.5)
+            time.sleep(0.3)
             
+            # Remove the extra window switch since we should still be focused
             return True
-            
+                
         except Exception as e:
             logging.error(f"Error setting up game view: {e}")
             return False
+        
 
     def verify_player_colors(self) -> Tuple[bool, bool]:
         """Verify if players are set to correct colors."""
@@ -492,7 +506,6 @@ class MainFlow:
                             self.state_manager.transition_to(GameState.GAME_FOUND)
 
                     elif current_state == GameState.GAME_FOUND:
-                        logging.info("Game found, minimizing AoE II window during load...")
 
                         if self.wait_for_game_load():
                             self.state_manager.transition_to(GameState.LOADING_GAME)

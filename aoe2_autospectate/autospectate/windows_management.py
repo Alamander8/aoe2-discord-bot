@@ -101,3 +101,49 @@ def verify_window_exists(window_title):
     except Exception as e:
         logging.error(f"Error verifying window existence: {e}")
         return False
+    
+def verify_aoe2_window():
+    """Just verify AoE2 window exists without activating it."""
+    try:
+        windows = gw.getWindowsWithTitle("Age of Empires II: Definitive Edition")
+        return len(windows) > 0
+    except Exception as e:
+        logging.error(f"Error verifying AoE2 window: {e}")
+        return False
+    
+def setup_captureage_window():
+    """Initial setup of CaptureAge window position and size."""
+    try:
+        windows = gw.getWindowsWithTitle("CaptureAge")
+        if windows:
+            window = windows[0]
+            # Only reposition/resize if needed
+            if window.left != 0 or window.top != 0 or window.width != 1920 or window.height != 1080:
+                window.moveTo(0, 0)
+                window.resizeTo(1920, 1080)
+                logging.info("Set up CaptureAge window position and size")
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error setting up CaptureAge window: {e}")
+        return False
+
+def switch_to_captureage():
+    """Focus CaptureAge window without repositioning."""
+    try:
+        windows = gw.getWindowsWithTitle("CaptureAge")
+        if windows:
+            windows[0].activate()
+            time.sleep(0.1)  # Short delay for focus to take effect
+            
+            # Verify focus was obtained
+            active = gw.getActiveWindow()
+            if active and "CaptureAge" in active.title:
+                return True
+            
+            logging.warning("Failed to verify CaptureAge window focus")
+            return False
+        return False
+    except Exception as e:
+        logging.error(f"Error switching to CaptureAge: {e}")
+        return False

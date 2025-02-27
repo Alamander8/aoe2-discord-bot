@@ -28,40 +28,41 @@ GAME_MODE_FILTER = 'Random Map'
 
 
 # Player Colors with specific building icon detection
+# Improved HSV ranges focusing on vibrant unit colors
 PLAYER_HSV_RANGES = {
     'Blue': {
         'normal': {
-            'lower': (100, 150, 0),
-            'upper': (140, 255, 255)
+            'lower': (115, 200, 150),  # Higher saturation minimum, narrower hue range
+            'upper': (125, 255, 255)   # Keeping full upper ranges for bright units
         },
-        'icon': {  # For TC/Castle icons - more saturated/distinct
-            'lower': (100, 200, 200),
-            'upper': (140, 255, 255)
+        'icon': {  # Keep existing icon detection for TC/Castle icons
+            'lower': (115, 200, 200),
+            'upper': (125, 255, 255)
         }
     },
     'Red': {
         'normal': {
-            'lower': (0, 150, 70),
-            'upper': (10, 255, 255)
+            'lower': (0, 200, 150),    # Higher saturation minimum
+            'upper': (5, 255, 255)     # Narrower hue range
         },
-        'icon': {
+        'icon': {  # Keep existing icon detection
             'lower': (0, 200, 200),
-            'upper': (10, 255, 255)
+            'upper': (5, 255, 255)
         }
     },
     'Green': {
         'normal': {
-            'lower': (40, 70, 70),
-            'upper': (80, 255, 255)
+            'lower': (45, 200, 150),
+            'upper': (75, 255, 255)
         },
         'icon': {
-            'lower': (40, 200, 200),
-            'upper': (80, 255, 255)
+            'lower': (45, 200, 200),
+            'upper': (75, 255, 255)
         }
     },
     'Yellow': {
         'normal': {
-            'lower': (25, 150, 150),
+            'lower': (25, 200, 150),
             'upper': (35, 255, 255)
         },
         'icon': {
@@ -71,7 +72,7 @@ PLAYER_HSV_RANGES = {
     },
     'Cyan': {
         'normal': {
-            'lower': (85, 150, 150),
+            'lower': (85, 200, 150),
             'upper': (95, 255, 255)
         },
         'icon': {
@@ -81,27 +82,27 @@ PLAYER_HSV_RANGES = {
     },
     'Purple': {
         'normal': {
-            'lower': (130, 100, 100),
-            'upper': (160, 255, 255)
+            'lower': (135, 200, 150),
+            'upper': (150, 255, 255)
         },
         'icon': {
-            'lower': (130, 200, 200),
-            'upper': (160, 255, 255)
+            'lower': (135, 200, 200),
+            'upper': (150, 255, 255)
         }
     },
     'Gray': {
         'normal': {
-            'lower': (82, 82, 82),
-            'upper': (82, 82, 82)
+            'lower': (0, 0, 60),
+            'upper': (180, 30, 200)
         },
         'icon': {
-            'lower': (47, 47, 47),
-            'upper': (47, 47, 47)
+            'lower': (0, 0, 150),
+            'upper': (180, 30, 255)
         }
     },
     'Orange': {
         'normal': {
-            'lower': (15, 150, 150),
+            'lower': (15, 200, 150),
             'upper': (25, 255, 255)
         },
         'icon': {
@@ -116,7 +117,7 @@ BUILDING_ICON_MIN_AREA = 15  # Minimum pixel area for TC/Castle icons
 BUILDING_ICON_MAX_AREA = 50  # Maximum pixel area
 BUILDING_ICON_MIN_CIRCULARITY = 0.6  # How circular the icon should be (1.0 is perfect circle)
 
-
+MIN_GAME_ELO=1050
 
 # Game settings
 MAX_PLAYERS = 8

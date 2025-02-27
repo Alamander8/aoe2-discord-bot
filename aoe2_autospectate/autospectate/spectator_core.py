@@ -11,6 +11,8 @@ from threading import Lock
 import math
 from betting_bridge import BettingBridge 
 import requests
+from windows_management import switch_to_captureage
+from windows_management import *
 
 class ViewingQueue:
     def __init__(self, min_revisit_time: float = 4.0, proximity_radius: int = 50):
@@ -132,7 +134,7 @@ class BaseMonitor:
     def __init__(self, spectator_core):
         self.spectator_core = spectator_core
         self.last_base_check = {}
-        self.base_check_interval = 35  # seconds
+        self.base_check_interval = 60  # seconds
         self.min_base_view_time= 3.0
         self.growth_areas = {}
         self.last_positions = {}  # To track previous positions for growth detection
@@ -415,11 +417,11 @@ class SpectatorCore:
         
         # Create steep dropoff for dark areas (fog of war, water)
         # This function heavily penalizes dark areas while being more lenient to medium-bright areas
-        brightness_multiplier = np.power(brightness, 1.5)  # Steeper than linear dropoff
+        brightness_multiplier = np.power(brightness, 2.0)  # Steeper than linear dropoff
         
         # Additional penalty for very dark areas (likely water/fog)
-        if brightness < 0.3:  # Very dark
-            brightness_multiplier *= 0.3
+        if brightness < 0.4:  # Very dark
+            brightness_multiplier *= 0.2
         
         # Don't completely zero out importance, but reduce it significantly for dark areas
         adjusted_importance = activity['importance'] * max(0.1, brightness_multiplier)
@@ -518,12 +520,12 @@ class SpectatorCore:
                 'Blue': current_time - self.last_visit_times['Blue']['economy'],
                 'Red': current_time - self.last_visit_times['Red']['economy']
             }
-            needs_eco_check = any(t > 45.0 for t in time_since_eco.values())
+            needs_eco_check = any(t > 60.0 for t in time_since_eco.values())
 
             # Handle territory breaches (with increased importance)
             breaches = self.check_territory_breaches(curr_minimap, mask)
             for breach in breaches:
-                breach['importance'] *= 3.5
+                breach['importance'] *= 3.6
                 if breach.get('color'):
                     balance_multiplier = self.base_monitor.get_balance_multiplier(breach['color'])
                     breach['importance'] *= balance_multiplier
@@ -569,11 +571,11 @@ class SpectatorCore:
                     activity['importance'] *= max(1.0, 2.5 - (dist_to_enemy_base / 50))
                 
                 # Combat detection
-                if closest_enemy < 25:  # More sensitive combat detection
+                if closest_enemy < 30:  # More sensitive combat detection
                     activity['type'] = 'major_combat'
                     activity['importance'] *= 5.0
                     activity['view_duration'] = self.combat_view_duration
-                elif closest_enemy < 35:  # New tier for nearby units
+                elif closest_enemy < 40:  # New tier for nearby units
                     activity['type'] = 'potential_combat'
                     activity['importance'] *= 2.6
                 
@@ -587,7 +589,7 @@ class SpectatorCore:
                             enemy_base[1] - activity['position'][1]
                         )
                         if vector_to_enemy[0] * vector_to_enemy[0] + vector_to_enemy[1] * vector_to_enemy[1] > 0:
-                            activity['importance'] *= 1.6  # Extra boost if moving toward enemy
+                            activity['importance'] *= 1.7  # Extra boost if moving toward enemy
                 
                 # Time balance factor
                 time_since_military = current_time - self.last_visit_times[activity['color']]['military']
@@ -1119,19 +1121,19 @@ class SpectatorCore:
         dist_from_home = self.calculate_distance(position, own_base)
         
         # Calculate base importance from unit size
-        base_importance = min(1.0, area / 15.0)  * 1.2 # Adjusted for minimap scale
+        base_importance = min(1.0, area / 12.0)  * 1.4 # Adjusted for minimap scale
         
         # Heavy bonus for being away from home base
         # Start scaling up at 50 pixels, max bonus at 150 pixels
-        distance_multiplier = min(4.0, max(1.0, dist_from_home / 25))
+        distance_multiplier = min(4.0, max(1.0, dist_from_home / 20))
         
         # Movement is very important
-        movement_multiplier = 4.0 if is_moving else 0.2
+        movement_multiplier = 5.0 if is_moving else 0.2
         
         # Check if in enemy territory
         enemy_color = 'Red' if color == 'Blue' else 'Blue'
         enemy_density = self.territory_tracker.get_color_density(enemy_color)
-        territory_multiplier = 1.1
+        territory_multiplier = 1.2
         
         if enemy_density is not None:
             x, y = position
@@ -1147,13 +1149,13 @@ class SpectatorCore:
                 area_control = np.mean(enemy_density[y_start:y_end, x_start:x_end])
                 
                 if territory_control > 0.5:  # Deep in enemy territory
-                    territory_multiplier = 4.5  # Slightly higher
+                    territory_multiplier = 5.0  # Slightly higher
                 elif territory_control > 0.2:  # Near enemy territory
-                    territory_multiplier = 2.5
+                    territory_multiplier = 3.0
                 
                 # Additional boost if in contested area (both players have presence)
                 if area_control > 0.3 and area_control < 0.7:
-                    territory_multiplier *= 1.5
+                    territory_multiplier *= 2.0
         
         # Static position penalty for large areas (likely buildings)
         if area > 20 and not is_moving:  # TC/Castle sized
@@ -1484,7 +1486,7 @@ class SpectatorCore:
                 
                 for enemy_pos in player_positions[enemy_color]:
                     dist = self.calculate_distance(pos, enemy_pos)
-                    if dist < 35:  # Increased from 25 - more sensitive to nearby units
+                    if dist < 28:  # Increased from 25 - more sensitive to nearby units
                         activity['type'] = 'major_combat'
                         activity['importance'] *= 4.5  # Increased from 4.0 for stronger combat priority
                         activity['view_duration'] = self.combat_view_duration
@@ -1692,34 +1694,71 @@ class SpectatorCore:
             return None
 
 
-
-
-
     def run_spectator(self):
-        """Main spectator loop."""
+        """Main spectator loop with time-limited focus monitoring."""
         logging.info("Starting spectator")
         try:
             # Trigger betting start
             if self.betting_bridge:
                 self.betting_bridge.on_game_start()
-                
+            
+            # Initialize focus check parameters
+            start_time = time.time()
+            last_focus_check = start_time
+            focus_check_interval = 2.0  # Check every 2 seconds
+            focus_check_duration = 180.0  # 3 minutes
+            focus_checks_enabled = True
+            
             while True:
+                current_time = time.time()
+                
+                # Only perform focus checks during the initial period
+                if focus_checks_enabled:
+                    if current_time - start_time > focus_check_duration:
+                        focus_checks_enabled = False
+                        logging.info("Focus check period completed")
+                    elif current_time - last_focus_check >= focus_check_interval:
+                        last_focus_check = current_time
+                        
+                        active_window = gw.getActiveWindow()
+                        if not active_window or "CaptureAge" not in active_window.title:
+                            logging.warning("CaptureAge window not focused, attempting to restore...")
+                            if switch_to_captureage():
+                                logging.info("Successfully restored CaptureAge window focus")
+                                time.sleep(0.2)
+                
+                # Run normal spectator iteration
                 iteration_result = self.run_spectator_iteration()
                 if not iteration_result:  # Game has ended
+                    # Get winner before cleanup
+                    winner = self.determine_winner()
+                    if winner and self.betting_bridge:
+                        self.betting_bridge.on_game_end(winner)
                     logging.info("Game has ended, exiting spectator loop")
                     return True  # Clean exit - game ended normally
+                    
                 time.sleep(0.5)  # Prevent excessive CPU usage
-                            
+                        
         except KeyboardInterrupt:
             logging.info("Spectator stopped by user")
             return False
         except Exception as e:
             logging.error(f"Error in spectator loop: {e}")
             return False
+    
 
     def run_spectator_iteration(self):
         """Run a single iteration of the spectator logic."""
         try:
+            current_time=time.time()
+            should_check_military = False
+            if not hasattr(self, 'last_military_check'):
+                self.last_military_check = current_time
+                should_check_military = True
+            elif current_time - self.last_military_check >= self.military_check_interval:
+                should_check_military = True
+                self.last_military_check = current_time
+
             if self.detect_game_over():
                 if hasattr(self, 'betting_bridge') and self.betting_bridge:
                     winner = self.determine_winner()
@@ -1952,7 +1991,15 @@ class SpectatorCore:
     def toggle_military_view(self):
         """Toggle the military-only view state"""
         pyautogui.hotkey('alt', 'm')
-        time.sleep(0.1)  # Small delay to ensure view changes
+        time.sleep(0.2)  # Small delay to ensure view changes
+
+
+    def restore_normal_view(self):
+        """Restore to normal view by toggling twice"""
+        pyautogui.hotkey('alt', 'm')
+        time.sleep(0.2)
+        pyautogui.hotkey('alt', 'm')
+        time.sleep(0.2)
 
     def detect_military_activity(self):
         """Detect military activity with enhanced proximity scoring"""

@@ -28,6 +28,50 @@ class BettingPool:
     end_time: Optional[float]
 
 
+class HouseBetting:
+    """Manages house betting behavior"""
+    
+    # Base ranges for normal bets
+    NORMAL_MIN = 40
+    NORMAL_MAX = 200
+    
+    # Spicy bet ranges (when house decides to go big)
+    SPICY_MIN = 240
+    SPICY_MAX = 550
+    
+    # Chances for spicy bets
+    SPICY_CHANCE = 0.10  # 10% chance for a spicy bet
+    
+    @staticmethod
+    def get_bet_amount() -> int:
+        """Get a single house bet amount with spicy chance"""
+        if random.random() < HouseBetting.SPICY_CHANCE:
+            return random.randint(HouseBetting.SPICY_MIN, HouseBetting.SPICY_MAX)
+        return random.randint(HouseBetting.NORMAL_MIN, HouseBetting.NORMAL_MAX)
+        
+    @staticmethod
+    def get_announcement(blue_amount: int, red_amount: int) -> str:
+        """Get appropriate announcement based on bet sizes"""
+        blue_spicy = blue_amount > HouseBetting.NORMAL_MAX
+        red_spicy = red_amount > HouseBetting.NORMAL_MAX
+        
+        if blue_spicy and red_spicy:
+            return f"House going BIG with {blue_amount} on Blue AND {red_amount} on Red!"
+        elif blue_spicy:
+            return f"House going BIG with {blue_amount} on Blue and {red_amount} on Red!"
+        elif red_spicy:
+            return f"House bets {blue_amount} on Blue and going BIG with {red_amount} on Red!"
+        else:
+            return f"House bets {blue_amount} on Blue and {red_amount} on Red."
+
+
+
+
+
+
+
+
+
 class BettingBot(commands.Bot):
     def __init__(self, token: str, channel: str):
         token = token.replace('oauth:', '')
@@ -100,8 +144,8 @@ class BettingBot(commands.Bot):
             self.betting_pool.end_time = time.time() + duration
 
         # Add house bets
-        house_blue = random.randint(40, 200)
-        house_red = random.randint(40, 200)
+        house_blue = HouseBetting.get_bet_amount()
+        house_red = HouseBetting.get_bet_amount()
         
         self.betting_pool.bets['house_blue'] = Bet(
             user_id='house_blue',
@@ -121,8 +165,9 @@ class BettingBot(commands.Bot):
         self.betting_pool.total_blue += house_blue
         self.betting_pool.total_red += house_red
 
+        announcement = HouseBetting.get_announcement(house_blue, house_red)
         await self.get_channel(self.channel).send(
-            f"Betting is now open for {duration} seconds! House bets {house_blue} on Blue and {house_red} on Red. Use !bet <amount> blue/red"
+            f"Betting is now open for {duration} seconds! {announcement} Use !bet <amount> blue/red"
         )
         
 

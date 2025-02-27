@@ -92,8 +92,9 @@ class OBSManager:
         except Exception as e:
             logging.error(f"Error switching scene: {e}")
             return False
-
+            
     def update_match_text(self, match_info):
+        """Update the match text with enhanced player information."""
         try:
             if not self.ensure_obs_connected():
                 return False
@@ -102,47 +103,68 @@ class OBSManager:
             map_name = "Random Map" if not map_name or map_name.isspace() or map_name == '\t' else map_name
             
             players = match_info.get('players', [])
-            elo_info = match_info.get('elos', ['', ''])  # Add ELO support
-            
-            player1 = f"{players[0]} ({elo_info[0]})" if len(players) > 0 else "Player 1"
-            player2 = f"{players[1]} ({elo_info[1]})" if len(players) > 1 else "Player 2"
+            elos = match_info.get('elos', ['', ''])
+            civilizations = match_info.get('civilizations', ['', ''])
             server = match_info.get('server', 'Unknown Server')
 
-            match_text = f"{player1} vs {player2}\n{map_name} | {server}"
+            # Format each player with their ELO and civilization
+            player_texts = []
+            for i in range(min(len(players), 2)):
+                player_name = players[i] if i < len(players) else "Player"
+                elo = f"({elos[i]})" if i < len(elos) and elos[i] else ""
+                civ = f"[{civilizations[i]}]" if i < len(civilizations) and civilizations[i] else ""
+                player_texts.append(f"{player_name} {elo} {civ}".strip())
 
+            # Center-aligned text with line breaks
+            match_text = (
+                f"{player_texts[0]} VS {player_texts[1]}\n"
+                f"{map_name} | {server}"
+            )
+
+            # Set text with center alignment property
             response = self.ws.call(requests.SetInputSettings(
                 inputName="MatchInfo",
-                inputSettings={"text": match_text}
+                inputSettings={
+                    "text": match_text,
+                    "align": "center"  # This may need to be adjusted based on your OBS version
+                }
             ))
             
             if not response.status:
                 logging.error(f"Failed to update text: {response.datain}")
                 return False
-                
+                    
             return True
 
         except Exception as e:
             logging.error(f"Error updating match text: {e}")
             return False
+        
+
 
     def clear_match_text(self):
+        """Clear the match text using the correct OBS request type."""
         try:
             if not self.ensure_obs_connected():
                 return False
 
-            response = self.ws.call(requests.SetTextGDIPlusProperties(
-                source="MatchInfo",
-                text=""
+            response = self.ws.call(requests.SetInputSettings(
+                inputName="MatchInfo",
+                inputSettings={"text": ""}
             ))
+            
             if response.status:
                 logging.info("Successfully cleared match text")
                 return True
+                
             logging.error(f"Failed to clear match text. Response: {response}")
             return False
 
         except Exception as e:
             logging.error(f"Error clearing match text: {e}")
             return False
+
+
 
     def disconnect(self):
         if self.ws:
