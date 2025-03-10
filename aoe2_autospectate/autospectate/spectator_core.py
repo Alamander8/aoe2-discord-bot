@@ -20,12 +20,13 @@ class ViewingQueue:
         self.viewed_positions = {}
         self.min_revisit_time = min_revisit_time
         self.proximity_radius = proximity_radius
+        self.spectator_core = None
         
         # New tracking attributes
         self.view_counts = {}  # Track how many times we've viewed each area
-        self.last_base_visit = {}  # Track when we last visited each base
+        # self.last_base_visit = {}  # Track when we last visited each base
         self.staleness_threshold = 2  # Number of views before applying staleness
-        self.base_visit_interval = 45.0  # Seconds between forced base checks
+        self.base_visit_interval = 120.0  # Seconds between forced base checks
         self.max_view_count = 5
         self.staleness_penalty = 0.7
 
@@ -104,9 +105,9 @@ class ViewingQueue:
         self.queue.appendleft(base_zone)  # Add to front of queue
 
     def record_base_visit(self, color):
-        """Record when we visit a base"""
-        if color:
-            self.last_base_visit[color] = time.time()
+        """Forward to BaseMonitor for centralized tracking"""
+        if color and hasattr(self.spectator_core, 'base_monitor'):
+            self.spectator_core.base_monitor.last_base_check[color] = time.time()
 
     def reset_view_count(self, position):
         """Reset view count when we've moved far away"""
@@ -134,24 +135,45 @@ class BaseMonitor:
     def __init__(self, spectator_core):
         self.spectator_core = spectator_core
         self.last_base_check = {}
-        self.base_check_interval = 60  # seconds
+        self.base_check_interval = 120  # seconds
         self.min_base_view_time= 3.0
         self.growth_areas = {}
         self.last_positions = {}  # To track previous positions for growth detection
         self.forced_base_views={}
         self.last_base_view ={'Blue': 0, 'Red': 0}
-        self.minimum_interval_between_checks = 10.0
+        self.minimum_interval_between_checks = 60.0
         self.viewing_times = {'Blue': 0, 'Red': 0}
         self.last_view_update = time.time()
-        
+                
     def should_check_base(self, player_color, current_time):
-        """Now returns a priority instead of forcing immediate view"""
+        """Single, clear base check decision logic with game time adjustment"""
         last_check = self.last_base_check.get(player_color, 0)
-        if current_time - last_check >= self.base_check_interval:
+        time_since_check = current_time - last_check
+        
+        # Calculate game duration in minutes
+        if hasattr(self.spectator_core, 'game_start_time'):
+            game_minutes = (current_time - self.spectator_core.game_start_time) / 60
+            
+            # Gradually increase base check interval as game progresses
+            # Start with base_check_interval, increase by 15 seconds every 5 minutes
+            adjusted_interval = min(150, self.base_check_interval + (game_minutes / 5) * 15)
+        else:
+            adjusted_interval = self.base_check_interval
+        
+        # Check for active military to avoid interrupting combat
+        has_active_military = False
+        if hasattr(self.spectator_core, 'last_military_activities'):
+            has_active_military = any(
+                act.get('is_moving', False) and act.get('importance', 0) > 0.7
+                for act in self.spectator_core.last_military_activities
+            )
+        
+        # Only check base if enough time has passed AND no active military
+        if time_since_check >= adjusted_interval and not has_active_military:
             self.last_base_check[player_color] = current_time
             return True
         return False
-
+    
     def update_viewing_times(self, current_color, current_time):
         """Track viewing time per player"""
         if current_color:
@@ -281,7 +303,7 @@ class SpectatorCore:
         self.current_mask = None
         self.minimap_lock = Lock() 
         self.last_military_check = 0
-        self.military_check_interval = 8.0
+        self.military_check_interval = 5.0
         self.recent_visits = []
         self.last_density_map = None
         self.last_expansion_check = {
@@ -300,13 +322,13 @@ class SpectatorCore:
         self.player_colors_config = getattr(config, 'PLAYER_HSV_RANGES', {})
         
         # Activity thresholds
-        self.min_activity_area = 40
-        self.large_activity_threshold = 150
+        self.min_activity_area = 20
+        self.large_activity_threshold = 60
         
         # Timing settings
-        self.min_view_duration = 3.0
-        self.max_view_duration = 5.0
-        self.combat_view_duration = 10.0
+        self.min_view_duration = 3.5
+        self.max_view_duration = 5.5
+        self.combat_view_duration = 12.0
         self.last_switch_time = time.time()
         self.last_visit_times = {
             'Blue': {'military': 0, 'economy': 0},
@@ -315,8 +337,8 @@ class SpectatorCore:
         
         # Previous frame storage for movement detection
         self.prev_frame = None
-        self.movement_weight = 0.7  # Moderate boost for movement
-        self.static_weight = 0.2  # Still significant weight for static elements
+        self.movement_weight = 0.8  # Moderate boost for movement
+        self.static_weight = 0.3  # Still significant weight for static elements
 
         # Initialize territory tracker with building parameters from config
         building_params = {
@@ -327,6 +349,7 @@ class SpectatorCore:
         self.territory_tracker = TerritoryTracker(building_params)
         self.viewing_queue = ViewingQueue(min_revisit_time=3.0, proximity_radius=50)
         
+        
         # Active colors for 1v1
         self.active_colors = ['Blue', 'Red']
 
@@ -335,6 +358,7 @@ class SpectatorCore:
         # Debug flags
         self.debug_mode = False
         self.last_minimap_mask = None
+        self.viewing_queue.spectator_core = self
 
     def _cleanup_recent_visits(self, current_time, retention_time=60.0):
         """Remove old visits from tracking"""
@@ -553,10 +577,10 @@ class SpectatorCore:
                 
                 # Multiple enemies nearby increases importance
                 if nearby_enemies:
-                    activity['importance'] *= (1.0 + (len(nearby_enemies) * 0.3))
+                    activity['importance'] *= (1.0 + (len(nearby_enemies) * 0.5))
                     if len(nearby_enemies) >= 2:
                         activity['type'] = 'potential_engagement'
-                        activity['importance'] *= 1.7
+                        activity['importance'] *= 2.5
                 
                 # Combat detection
                 closest_enemy = min([self.calculate_distance(activity['position'], e['position']) 
@@ -577,7 +601,7 @@ class SpectatorCore:
                     activity['view_duration'] = self.combat_view_duration
                 elif closest_enemy < 40:  # New tier for nearby units
                     activity['type'] = 'potential_combat'
-                    activity['importance'] *= 2.6
+                    activity['importance'] *= 3.0
                 
                 # Movement bonus
                 if activity.get('is_moving', False):
@@ -761,7 +785,7 @@ class SpectatorCore:
             end_y = min(self.game_area_y + self.game_area_height, start_y + box_height)
             
             self.drag_and_follow(start_x, start_y, end_x, end_y)
-            self.forced_view_until = time.time() + 15.0  # 15 seconds minimum for major combat
+            self.forced_view_until = time.time() + 12.0  # 12 seconds minimum for major combat
             logging.info(f"Initiated drag-follow for army vs army combat")
                 
         except Exception as e:
@@ -1141,7 +1165,7 @@ class SpectatorCore:
                 territory_control = enemy_density[y, x]
                 
                 # Get average control in surrounding area
-                area_size = 8
+                area_size = 14
                 x_start = max(0, x - area_size)
                 x_end = min(enemy_density.shape[1], x + area_size)
                 y_start = max(0, y - area_size)
@@ -1151,11 +1175,11 @@ class SpectatorCore:
                 if territory_control > 0.5:  # Deep in enemy territory
                     territory_multiplier = 5.0  # Slightly higher
                 elif territory_control > 0.2:  # Near enemy territory
-                    territory_multiplier = 3.0
+                    territory_multiplier = 3.5
                 
                 # Additional boost if in contested area (both players have presence)
                 if area_control > 0.3 and area_control < 0.7:
-                    territory_multiplier *= 2.0
+                    territory_multiplier *= 3.0
         
         # Static position penalty for large areas (likely buildings)
         if area > 20 and not is_moving:  # TC/Castle sized
@@ -1402,7 +1426,7 @@ class SpectatorCore:
                             
                             # Movement is critical - much higher importance for moving units
                             if is_moving:
-                                importance *= 4.0
+                                importance *= 5.0
                             
                             # Distance from base importance
                             if dist_from_home > 30:  # Significantly away from base
@@ -1465,7 +1489,7 @@ class SpectatorCore:
                                     elif position_ratio > 0.6:
                                         activity['importance'] *= 0.5  # Moderate penalty for back positions
                                     elif position_ratio < 0.5:
-                                        activity['importance'] *= 1.5  # Bonus for forward positions
+                                        activity['importance'] *= 1.8  # Bonus for forward positions
                             
                             # Store position and add to activities
                             player_positions[color].append((cx, cy))
@@ -1488,12 +1512,12 @@ class SpectatorCore:
                     dist = self.calculate_distance(pos, enemy_pos)
                     if dist < 28:  # Increased from 25 - more sensitive to nearby units
                         activity['type'] = 'major_combat'
-                        activity['importance'] *= 4.5  # Increased from 4.0 for stronger combat priority
+                        activity['importance'] *= 5.0  # Increased from 4.0 for stronger combat priority
                         activity['view_duration'] = self.combat_view_duration
                         break
             
             military_data['activities'] = self._deduplicate_activities(
-                military_activities, proximity_threshold=12  # Smaller radius
+                military_activities, proximity_threshold=10  # Smaller radius
             )
             return military_data
                 
@@ -1831,7 +1855,7 @@ class SpectatorCore:
                         if base_pos:
                             self.viewing_queue.add_zone({
                                 'position': base_pos,
-                                'importance': 0.8,
+                                'importance': 0.6,
                                 'type': 'base_check',
                                 'color': color,
                                 'timestamp': current_time
@@ -2410,7 +2434,7 @@ class TerritoryTracker:
         self.territories = {}
         self.heat_map = None
         self.last_update = 0
-        self.update_interval = 1.0  # Reduced for more frequent updates
+        self.update_interval = 2.0  # Reduced for more frequent updates
         self.last_density_map = None
         self.prev_frame = {}
         
@@ -2421,7 +2445,7 @@ class TerritoryTracker:
         self.base_detection_threshold = 0.20
         
         # Parameters for clustering
-        self.cluster_distance = 25
+        self.cluster_distance = 20
         self.detection_radius = 30
         
         # Building parameters from config (or defaults)
@@ -2652,8 +2676,11 @@ class TerritoryTracker:
                 self.prev_frame = {}
             
             # cleanup - only keep blue and red
-            self.prev_frame = {k: v for k in ['Blue', 'Red'] if k in self.prev_frame}
-
+            self.prev_frame = {}
+            for color in ['Blue', 'Red']:
+                density = self.get_color_density(minimap_image, color, hsv_ranges, minimap_mask)
+                if density is not None:
+                    self.prev_frame[color] = density
 
             for attacker in self.territories:
                 for defender in self.territories:

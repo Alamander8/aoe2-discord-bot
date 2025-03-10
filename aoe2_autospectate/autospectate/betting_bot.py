@@ -179,7 +179,7 @@ class BettingBot(commands.Bot):
                 f"⚠️ 30 SECONDS LEFT TO BET! Current pool: {total_pool} 🧂 (Blue: {self.betting_pool.total_blue}, Red: {self.betting_pool.total_red})"
             )
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(55)
         await self.close_betting()
         return True
 
