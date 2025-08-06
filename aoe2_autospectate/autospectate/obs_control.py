@@ -92,55 +92,47 @@ class OBSManager:
         except Exception as e:
             logging.error(f"Error switching scene: {e}")
             return False
-            
+                            
     def update_match_text(self, match_info):
-        """Update the match text with enhanced player information."""
+        """Update the match information text in OBS"""
         try:
-            if not self.ensure_obs_connected():
-                return False
-
-            map_name = match_info.get('map', '').strip()
-            map_name = "Random Map" if not map_name or map_name.isspace() or map_name == '\t' else map_name
+            if not match_info:
+                return self.clear_match_text()
             
-            players = match_info.get('players', [])
-            elos = match_info.get('elos', ['', ''])
-            civilizations = match_info.get('civilizations', ['', ''])
-            server = match_info.get('server', 'Unknown Server')
-
-            # Format each player with their ELO and civilization
-            player_texts = []
-            for i in range(min(len(players), 2)):
-                player_name = players[i] if i < len(players) else "Player"
-                elo = f"({elos[i]})" if i < len(elos) and elos[i] else ""
-                civ = f"[{civilizations[i]}]" if i < len(civilizations) and civilizations[i] else ""
-                player_texts.append(f"{player_name} {elo} {civ}".strip())
-
-            # Center-aligned text with line breaks
-            match_text = (
-                f"{player_texts[0]} VS {player_texts[1]}\n"
-                f"{map_name} | {server}"
-            )
-
-            # Set text with center alignment property
+            # Extract tier information
+            tier = match_info.get('tier', '?')
+            rating = match_info.get('rating', 0)
+            
+            # Format as: "B Tier - Arabia [~1452]"
+            # Then player names and civs below
+            line1 = f"{tier} Tier - {match_info.get('map', 'Unknown')} [~{rating}]"
+            
+            # Player info
+            p1_name = match_info['players'][0] if len(match_info.get('players', [])) > 0 else 'Player 1'
+            p2_name = match_info['players'][1] if len(match_info.get('players', [])) > 1 else 'Player 2'
+            p1_civ = match_info['civilizations'][0] if len(match_info.get('civilizations', [])) > 0 else '?'
+            p2_civ = match_info['civilizations'][1] if len(match_info.get('civilizations', [])) > 1 else '?'
+            
+            line2 = f"{p1_name} ({p1_civ}) vs {p2_name} ({p2_civ})"
+            
+            text_content = f"{line1}\n{line2}"
+            
+            # Update the text source in OBS
             response = self.ws.call(requests.SetInputSettings(
                 inputName="MatchInfo",
-                inputSettings={
-                    "text": match_text,
-                    "align": "center"  # This may need to be adjusted based on your OBS version
-                }
+                inputSettings={"text": text_content}
             ))
             
             if not response.status:
                 logging.error(f"Failed to update text: {response.datain}")
                 return False
-                    
+            
+            logging.info(f"Updated OBS text: {text_content.replace(chr(10), ' | ')}")  # Log single line version
             return True
 
         except Exception as e:
             logging.error(f"Error updating match text: {e}")
             return False
-        
-
 
     def clear_match_text(self):
         """Clear the match text using the correct OBS request type."""

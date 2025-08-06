@@ -28,16 +28,31 @@ class BettingPool:
     end_time: Optional[float]
 
 
+@dataclass
+class Player:
+    user_id: str
+    username: str
+    points: int = 500  # Default starting amount
+    age: str = "Dark"
+    biggest_win: int = 0
+    biggest_loss: int = 0
+    biggest_bet: int = 0
+    total_bets: int = 0
+    wins: int = 0
+    losses: int = 0
+    last_updated: float = time.time()  # Timestamp
+
+
 class HouseBetting:
     """Manages house betting behavior"""
     
     # Base ranges for normal bets
-    NORMAL_MIN = 40
-    NORMAL_MAX = 200
+    NORMAL_MIN = 80
+    NORMAL_MAX = 250
     
     # Spicy bet ranges (when house decides to go big)
-    SPICY_MIN = 240
-    SPICY_MAX = 550
+    SPICY_MIN = 350
+    SPICY_MAX = 700
     
     # Chances for spicy bets
     SPICY_CHANCE = 0.10  # 10% chance for a spicy bet
@@ -91,10 +106,37 @@ class BettingBot(commands.Bot):
         self.betting_pool = None
         logging.info(f"BettingBot initialized for channel: {channel}")
 
-    def load_points(self) -> Dict[str, int]:
+    def load_points(self) -> Dict[str, Player]:
         try:
             with open(self.points_file, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                
+                # Create players dict
+                players = {}
+                for user_id, value in data.items():
+                    if isinstance(value, dict):
+                        # New format
+                        players[user_id] = Player(
+                            user_id=user_id,
+                            username=value.get('username', 'Unknown'),
+                            points=value.get('points', 500),
+                            age=value.get('age', 'Dark'),  # Add this line to load the age
+                            biggest_win=value.get('biggest_win', 0),
+                            biggest_loss=value.get('biggest_loss', 0),
+                            biggest_bet=value.get('biggest_bet', 0),
+                            total_bets=value.get('total_bets', 0),
+                            wins=value.get('wins', 0),
+                            losses=value.get('losses', 0),
+                            last_updated=value.get('last_updated', 0)
+                        )
+                    else:
+                        # Old format - convert to new format
+                        players[user_id] = Player(
+                            user_id=user_id,
+                            username='Unknown',
+                            points=value
+                        )
+                return players
         except FileNotFoundError:
             return {}
 
@@ -106,14 +148,24 @@ class BettingBot(commands.Bot):
                 backup_file = f"{self.points_file}.backup"
                 shutil.copy2(self.points_file, backup_file)
 
+            # Convert Player objects to dictionaries
+            data_to_save = {}
+            for user_id, player in self.user_points.items():
+                if isinstance(player, Player):
+                    data_to_save[user_id] = asdict(player)
+                else:
+                    # Handle old data format for compatibility
+                    data_to_save[user_id] = player
+            
             # Save new data
             with open(self.points_file, 'w') as f:
-                json.dump(self.user_points, f)
+                json.dump(data_to_save, f, indent=2)
 
             # Verify save
             with open(self.points_file, 'r') as f:
                 saved_data = json.load(f)
-                if saved_data != self.user_points:
+                # Basic verification
+                if len(saved_data) != len(self.user_points):
                     logging.error("Point save verification failed!")
                     return False
 
@@ -123,6 +175,70 @@ class BettingBot(commands.Bot):
         except Exception as e:
             logging.error(f"Error saving points: {e}")
             return False
+
+    def get_player_points(self, user_id):
+        """Get player points with compatibility for both formats"""
+        if user_id not in self.user_points:
+            return 0
+        
+        player = self.user_points[user_id]
+        if isinstance(player, Player):
+            return player.points
+        return player  # Old format
+
+    def update_player_points(self, user_id, username, amount):
+        """Update player points with tracking"""
+        if user_id not in self.user_points:
+            self.user_points[user_id] = Player(user_id=user_id, username=username, points=amount)
+        else:
+            player = self.user_points[user_id]
+            if isinstance(player, Player):
+                player.points = max(0, player.points + amount)
+                player.username = username  # Always update username
+                player.last_updated = time.time()
+            else:
+                # Convert to new format
+                new_points = max(0, player + amount)
+                self.user_points[user_id] = Player(
+                    user_id=user_id,
+                    username=username,
+                    points=new_points
+                )
+
+
+    def track_bet(self, user_id, username, amount, team):
+        """Track bet statistics"""
+        if user_id not in self.user_points:
+            return
+            
+        player = self.user_points[user_id]
+        if isinstance(player, Player):
+            player.username = username
+            player.total_bets += 1
+            player.biggest_bet = max(player.biggest_bet, amount)
+            player.last_updated = time.time()
+
+    def track_win(self, user_id, win_amount):
+        """Track win statistics"""
+        if user_id not in self.user_points:
+            return
+            
+        player = self.user_points[user_id]
+        if isinstance(player, Player):
+            player.wins += 1
+            player.biggest_win = max(player.biggest_win, win_amount)
+            player.last_updated = time.time()
+
+    def track_loss(self, user_id, loss_amount):
+        """Track loss statistics"""
+        if user_id not in self.user_points:
+            return
+            
+        player = self.user_points[user_id]
+        if isinstance(player, Player):
+            player.losses += 1
+            player.biggest_loss = max(player.biggest_loss, loss_amount)
+            player.last_updated = time.time()
 
     async def start_betting(self, duration: int = 180):
         # Don't create new pool if exists and active
@@ -217,15 +333,33 @@ class BettingBot(commands.Bot):
         except Exception as e:
             logging.error(f"Error handling command: {e}")
 
+    @commands.command(name='ages')
+    async def ages_command(self, ctx):
+        """Display age advancement information"""
+        await ctx.send("🏰 AGE ADVANCEMENT 🏰")
+        await ctx.send("Dark Age → Feudal Age (1000 salt): Better pound (50-240) and faster cooldown (27 min)")
+        await ctx.send("Feudal Age → Castle Age (2000 salt): Better pound (60-280) and faster cooldown (24 min)")
+        await ctx.send("Castle Age → Imperial Age (5000 salt): Best pound (80-350) and fastest cooldown (20 min)")
+
     @commands.command(name='pound')
     async def claim_command(self, ctx):
         user_id = str(ctx.author.id)
         current_time = time.time()
         
-        # Get modified cooldown if user has a unit type
-        modified_cooldown = self.claim_cooldown_time
-        if civ := self.civ_manager.get_user_civ(user_id):
-            modified_cooldown = self.claim_cooldown_time * civ.pound_cooldown_multiplier
+        # Age benefits
+        age_benefits = {
+            "Dark": {"min": 40, "max": 200, "cooldown": 1800},
+            "Feudal": {"min": 50, "max": 240, "cooldown": 1620},
+            "Castle": {"min": 60, "max": 280, "cooldown": 1440},
+            "Imperial": {"min": 80, "max": 350, "cooldown": 1200}
+        }
+        
+        # Get player's age or default to Dark
+        player = self.user_points.get(user_id, None)
+        player_age = getattr(player, 'age', "Dark") if player else "Dark"
+        
+        # Get modified cooldown based on age
+        modified_cooldown = age_benefits[player_age]["cooldown"]
         
         # Check cooldown with modified time
         if user_id in self.claim_cooldowns:
@@ -237,47 +371,129 @@ class BettingBot(commands.Bot):
 
         # If user is new, give starting amount
         if user_id not in self.user_points:
-            self.user_points[user_id] = 500
+            self.user_points[user_id] = Player(
+                user_id=user_id,
+                username=ctx.author.name,
+                points=500,
+                age="Dark"
+            )
             await ctx.send(f"@{ctx.author.name} Welcome! You received 500 pounds of starting salt!")
         else:
-            # Give random amount between 40 and 200
-            claim_amount = random.randint(40, 200)
-            if civ := self.civ_manager.get_user_civ(user_id):
-                claim_amount = int(claim_amount * civ.pound_multiplier)
-            self.user_points[user_id] += claim_amount
-            display_name = self.civ_manager.get_display_name(ctx.author.name, user_id)
-            await ctx.send(f"@{ctx.author.name} You claimed {claim_amount} pounds of salt! You now have {self.user_points[user_id]} total!")
+            # Give random amount based on age
+            min_amount = age_benefits[player_age]["min"]
+            max_amount = age_benefits[player_age]["max"]
+            claim_amount = random.randint(min_amount, max_amount)
+            
+            player.points += claim_amount
+            await ctx.send(f"@{ctx.author.name} You claimed {claim_amount} pounds of salt! You now have {player.points} total!")
 
         # Update cooldown and save
         self.claim_cooldowns[user_id] = current_time
-        self.save_points()  # Save after every points change
-    
-    
-    @commands.command(name='bet')
-    async def bet_command(self, ctx, amount: str = None, team: str = None):
-        logging.info(f"Bet command received - Amount: {amount}, Team: {team}, User: {ctx.author.name}")
-        
+        self.save_points()
 
-        if amount is None or team is None:
+
+    @commands.command(name='advance')
+    async def advance_command(self, ctx):
+        user_id = str(ctx.author.id)
+        if user_id not in self.user_points:
+            await ctx.send(f"@{ctx.author.name} You need to claim some salt first!")
+            return
+            
+        player = self.user_points[user_id]
+        current_age = getattr(player, 'age', "Dark")
+        
+        # Age advancement costs and next age
+        advancements = {
+            "Dark": {"next": "Feudal", "cost": 1000},
+            "Feudal": {"next": "Castle", "cost": 2000},
+            "Castle": {"next": "Imperial", "cost": 5000},
+            "Imperial": {"next": None, "cost": 0}
+        }
+        
+        # Check if already at max age
+        if current_age == "Imperial":
+            await ctx.send(f"@{ctx.author.name} You've already reached the Imperial Age!")
+            return
+        
+        # Get advancement details
+        next_age = advancements[current_age]["next"]
+        cost = advancements[current_age]["cost"]
+        
+        # Check if player has enough points
+        if player.points < cost:
+            await ctx.send(f"@{ctx.author.name} You need {cost} salt to advance to {next_age} Age. You have {player.points}.")
+            return
+        
+        # Process advancement
+        player.points -= cost
+        player.age = next_age
+        self.save_points()
+        
+        await ctx.send(f"🎉 @{ctx.author.name} has advanced to the {next_age} Age! 🎉")
+
+
+
+    @commands.command(name='bet')
+    async def bet_command(self, ctx, arg1: str = None, arg2: str = None):
+        """More flexible bet command that handles different parameter orders and formatting"""
+        logging.info(f"Bet command received - Args: {arg1} {arg2}, User: {ctx.author.name}")
+        
+        if arg1 is None or arg2 is None:
             await ctx.send("Usage: !bet <amount> <blue/red>")
             return
-
+        
+        # Determine which parameter is amount and which is team
+        amount_str = None
+        team = None
+        
+        # Try arg1 as amount, arg2 as team
         try:
-            amount = int(amount)
-            if amount < 10:  # Add minimum bet check here
+            int(arg1)
+            amount_str = arg1
+            team = arg2.lower()
+        except ValueError:
+            # Try arg2 as amount, arg1 as team
+            try:
+                int(arg2)
+                amount_str = arg2
+                team = arg1.lower()
+            except ValueError:
+                await ctx.send("Please provide a valid bet amount and team (blue/red)")
+                return
+        
+        # Standardize team name (accept variations)
+        if team in ['blue', 'b', 'bl']:
+            team = 'Blue'
+        elif team in ['red', 'r', 're']:
+            team = 'Red'
+        else:
+            await ctx.send("Please bet on either 'blue' or 'red'")
+            return
+        
+        # Process amount
+        try:
+            amount = int(amount_str)
+            if amount < 10:
                 await ctx.send(f"@{ctx.author.name} Minimum bet is 10 pounds!")
                 return
-                
             if amount <= 0:
                 raise ValueError
         except ValueError:
             await ctx.send("Please provide a valid positive number for your bet")
             return
 
-
         user_id = str(ctx.author.id)
-        current_points = self.user_points.get(user_id, 0)
-        if current_points < amount: #point check before bet processing
+        
+        # Get current points with compatibility for both formats
+        current_points = 0
+        if user_id in self.user_points:
+            player = self.user_points[user_id]
+            if isinstance(player, Player):
+                current_points = player.points
+            else:
+                current_points = player
+        
+        if current_points < amount:
             await ctx.send(f"@{ctx.author.name} Not enough salt! You have {current_points}")
             return
         
@@ -290,28 +506,12 @@ class BettingBot(commands.Bot):
             await ctx.send(f"@{ctx.author.name} You already placed a bet this round!")
             return
 
-        if amount is None or team is None:
-            await ctx.send("Usage: !bet <amount> <blue/red>")
-            return
-
         team = team.capitalize()
         if team not in ['Blue', 'Red']:
             await ctx.send("Please bet on either 'blue' or 'red'")
             return
 
-        try:
-            amount = int(amount)
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await ctx.send("Please provide a valid positive number for your bet")
-            return
-
-        # current_points = self.user_points.get(user_id, 0)
-        # if current_points < amount:
-        #     await ctx.send(f"@{ctx.author.name} Not enough points! You have {current_points}")
-        #     return
-
+        # Create the bet
         self.betting_pool.bets[user_id] = Bet(
             user_id=user_id,
             username=ctx.author.name,
@@ -320,18 +520,27 @@ class BettingBot(commands.Bot):
             timestamp=time.time()
         )
 
+        # Update totals
         if team == 'Blue':
             self.betting_pool.total_blue += amount
         else:
             self.betting_pool.total_red += amount
 
-        self.user_points[user_id] = current_points - amount
+        # Track statistics
+        if isinstance(self.user_points.get(user_id), Player):
+            player = self.user_points[user_id]
+            player.total_bets += 1
+            player.biggest_bet = max(player.biggest_bet, amount)
+            player.points -= amount
+            player.username = ctx.author.name  # Always update username
+        else:
+            # Old format - just update points
+            self.user_points[user_id] = current_points - amount
+
         self.save_points()
 
         pool_total = getattr(self.betting_pool, f"total_{team.lower()}")
         await ctx.send(f"@{ctx.author.name} bet {amount} pounds of salt on {team}! Total {team} pool: {pool_total}")
-
-
 
 
     async def resolve_bets(self, winner: str):
@@ -345,81 +554,109 @@ class BettingBot(commands.Bot):
         if winning_pool == 0:
             return False
 
-        # Track round results
-        self.last_round_results = []
+        # Group all winners first
+        winning_bets = [bet for bet in self.betting_pool.bets.values() if bet.team == winner]
+        losing_bets = [bet for bet in self.betting_pool.bets.values() if bet.team != winner]
         
-        # Process winners
-        winning_bets = [bet for bet in self.betting_pool.bets.values() 
-                    if bet.team == winner and not bet.user_id.startswith('house_')]
-        
+        # Send a single summary message first
         if winning_bets:
             await self.get_channel(self.channel).send(f"Results for {winner} victory:")
         
+        # Process each winner
         for bet in winning_bets:
             share = bet.amount / winning_pool
             winnings = bet.amount + int(losing_pool * share)
-            profit = winnings - bet.amount
             
-            # Update points
-            self.user_points[bet.user_id] = self.user_points.get(bet.user_id, 0) + winnings
+            # Update points with compatibility for both formats
+            if isinstance(self.user_points.get(bet.user_id), Player):
+                player = self.user_points[bet.user_id]
+                profit = winnings - bet.amount
+                player.points += winnings
+                player.wins += 1
+                player.biggest_win = max(player.biggest_win, profit)
+                player.username = bet.username  # Ensure username is current
+            else:
+                # Old format
+                current_points = self.user_points.get(bet.user_id, 0)
+                self.user_points[bet.user_id] = current_points + winnings
             
-            # Track result
-            self.last_round_results.append({
-                'username': bet.username,
-                'profit': profit,
-                'bet_amount': bet.amount
-            })
-            
+            # Single announcement per winner
             await self.get_channel(self.channel).send(
-                f"@{bet.username} won {winnings:,} pounds! "
-                f"(Bet: {bet.amount:,}, Bonus: +{int(losing_pool * share):,})"
+                f"@{bet.username} won {winnings} pounds! (Bet: {bet.amount}, Bonus: {int(losing_pool * share)})"
             )
         
-        # Track losers
-        losing_bets = [bet for bet in self.betting_pool.bets.values() 
-                    if bet.team != winner and not bet.user_id.startswith('house_')]
-        
+        # Track losses for losing bets
         for bet in losing_bets:
-            self.last_round_results.append({
-                'username': bet.username,
-                'profit': -bet.amount,
-                'bet_amount': bet.amount
-            })
+            if isinstance(self.user_points.get(bet.user_id), Player):
+                player = self.user_points[bet.user_id]
+                player.losses += 1
+                player.biggest_loss = max(player.biggest_loss, bet.amount)
 
         # Save updated points
         self.save_points()
-        self.betting_pool = None
+        self.betting_pool = None  # Clear betting pool after resolution
         return True
-
+    
 
     @commands.command(name='salt')
     async def points_command(self, ctx):
         """Check your current points"""
         user_id = str(ctx.author.id)
-        logging.info(f"Checking points for user {ctx.author.name} with ID {user_id}")
-        logging.info(f"Current points data: {self.user_points}")
         
-        current_points = self.user_points.get(user_id, 0)
-        await ctx.send(f"@{ctx.author.name} you have {current_points} pounds of salt!")
-
+        # Get points with compatibility for both formats
+        points = self.get_player_points(user_id)
+        
+        # Get player age if available
+        age = "Dark"
+        if user_id in self.user_points:
+            player = self.user_points[user_id]
+            if isinstance(player, Player):
+                age = player.age
+        
+        # Display points with age
+        await ctx.send(f"@{ctx.author.name} [{age} Age] you have {points} pounds of salt!")
 
     @commands.command(name='help')
     async def help_command(self, ctx):
         """Show available commands in Twitch-friendly format"""
         
-        # Core betting commands (most used)
-        await ctx.send("BETTING: !bet <amount> <blue/red> to place bet · !mybet to see your bet · !pool to see odds")
+        # Core betting commands
+        await ctx.send("💰 BETTING: !bet <amount> <blue/red> · !mybet · !pool")
+        
+        # Age advancement system
+        await ctx.send("🏰 AGES: !pound to claim salt · !salt to check balance · !advance to level up · !ages for info")
         
         # Stats and results
-        await ctx.send("RESULTS: !winners to see biggest wins · !losers to see biggest losses · !leaderboard for top salt holders")
+        await ctx.send("📊 STATS: !stats for your stats · !winners · !losers · !leaderboard for rankings")
         
-        # Salt management
-        await ctx.send("SALT: !pound to get salt (30m cooldown) · !salt to check balance")
+        # More help
+        await ctx.send("ℹ️ Need more info? Try !helpbet or !helpages for detailed command help")
+            
+    @commands.command(name='helpages')
+    async def help_ages_command(self, ctx):
+        """Detailed help for the age advancement system"""
         
-        # Unit system
-        await ctx.send("UNITS: !units to see types · !unit <type> to pick · !profile to check your unit")
+        await ctx.send("🏰 AGE ADVANCEMENT SYSTEM 🏰")
+        await ctx.send("Advance through ages to get better rewards and shorter cooldowns!")
+        await ctx.send("!advance - Level up to the next age (costs salt)")
+        await ctx.send("!ages - View advancement costs and benefits")
+        await ctx.send("!pound - Claim salt (rewards scale with your age)")
+        await ctx.send("!salt - Check your current salt balance")
+        await ctx.send("!stats - View your age, salt, and other statistics")
 
+    @commands.command(name='helpbet')
+    async def help_bet_command(self, ctx):
+        """Detailed help for betting system"""
         
+        await ctx.send("💰 BETTING SYSTEM 💰")
+        await ctx.send("!bet <amount> <blue/red> - Place a bet (also works as !bet blue 100)")
+        await ctx.send("!mybet - View your current bet and potential winnings")
+        await ctx.send("!pool - See current betting pool sizes and odds")
+        await ctx.send("!winners - See biggest winners from last round")
+        await ctx.send("!losers - See biggest losers from last round")
+   
+   
+   
     @commands.command(name='pool')
     async def pool_command(self, ctx):
         """Show current betting pool information"""
@@ -444,8 +681,8 @@ class BettingBot(commands.Bot):
             f"Blue: {self.betting_pool.total_blue:,} (x{blue_odds:.2f}) [{blue_betters} betters]\n"
             f"Red: {self.betting_pool.total_red:,} (x{red_odds:.2f}) [{red_betters} betters]"
         )
-
-
+    
+    
     @commands.command(name='mybet')
     async def mybet_command(self, ctx):
         """Show user's current bet"""
@@ -474,36 +711,43 @@ class BettingBot(commands.Bot):
         else:
             await ctx.send(f"@{ctx.author.name} You haven't placed a bet this round")
 
+
+    @commands.command(name='stats')
+    async def stats_command(self, ctx):
+        """Show user statistics with age"""
+        user_id = str(ctx.author.id)
+        if user_id not in self.user_points:
+            await ctx.send(f"@{ctx.author.name} No stats available.")
+            return
+            
+        player = self.user_points[user_id]
+        age = getattr(player, 'age', "Dark")
+        
+        await ctx.send(
+            f"@{ctx.author.name} [{age} Age] | Salt: {player.points} | "
+            f"W/L: {player.wins}/{player.losses} | "
+            f"Biggest Win: {player.biggest_win}"
+        )
+
     @commands.command(name='leaderboard')
     async def leaderboard_command(self, ctx):
-        """Show top 4 salt holders, excluding house accounts"""
-        # Filter out house accounts and sort by value
-        player_totals = {
-            user_id: amount 
-            for user_id, amount in self.user_points.items() 
-            if not user_id.startswith('house_')
-        }
+        """Show top 5 players by points"""
+        # Get players in new format
+        valid_players = {k: v for k, v in self.user_points.items() 
+                        if isinstance(v, Player) and not k.startswith('house_')}
         
-        sorted_users = sorted(
-            player_totals.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:4]
+        # Sort by points
+        top_players = sorted(valid_players.values(), key=lambda p: p.points, reverse=True)[:5]
         
-        if not sorted_users:
-            await ctx.send("No salt holders yet!")
+        if not top_players:
+            await ctx.send("No players on the leaderboard yet!")
             return
-        
-        entries = []
-        medals = ["🥇", "🥈", "🥉", "🏅"]  # Medals for top 4
-        
-        for i, (user_id, amount) in enumerate(sorted_users):
-            entries.append(f"{medals[i]} {amount:,} 🧂")
-        
-        await ctx.send("TOP SALT TOTALS:\n" + "\n".join(entries))
-
-
-
+            
+        message = "🏆 SALT LEADERBOARD 🏆\n"
+        for i, player in enumerate(top_players, 1):
+            message += f"{i}. {player.username}: {player.points} salt\n"
+            
+        await ctx.send(message)
 
     @commands.command(name='winners')
     async def winners_command(self, ctx):
@@ -512,9 +756,15 @@ class BettingBot(commands.Bot):
             await ctx.send("No completed betting rounds yet!")
             return
         
+        # Make sure we're working with a list
+        if not isinstance(self.last_round_results, list):
+            await ctx.send("No results data available!")
+            return
+            
+        # Sort results by profit
         sorted_winners = sorted(
             self.last_round_results,
-            key=lambda x: x['profit'],
+            key=lambda x: x.get('profit', 0) if isinstance(x, dict) else 0,
             reverse=True
         )[:3]
         
@@ -526,9 +776,9 @@ class BettingBot(commands.Bot):
         medals = ["🥇", "🥈", "🥉"]
         
         for i, result in enumerate(sorted_winners):
-            if result['profit'] > 0:  # Only show actual winners
+            if isinstance(result, dict) and result.get('profit', 0) > 0:  # Only show actual winners
                 entries.append(
-                    f"{medals[i]} {result['username']}: +{result['profit']:,} 🧂"
+                    f"{medals[i]} {result.get('username', 'Unknown')}: +{result.get('profit', 0):,} 🧂"
                 )
         
         if entries:
@@ -543,10 +793,16 @@ class BettingBot(commands.Bot):
             await ctx.send("No completed betting rounds yet!")
             return
         
+        # Make sure we're working with a list
+        if not isinstance(self.last_round_results, list):
+            await ctx.send("No results data available!")
+            return
+            
+        # Sort results by profit (ascending for losers)
         sorted_losers = sorted(
             self.last_round_results,
-            key=lambda x: x['profit']
-        )[:3]  # Ascending order for biggest losses
+            key=lambda x: x.get('profit', 0) if isinstance(x, dict) else 0
+        )[:3]
         
         if not sorted_losers:
             await ctx.send("No results from last round!")
@@ -556,9 +812,9 @@ class BettingBot(commands.Bot):
         medals = ["💀", "☠️", "👻"]  # Funny emojis for losers
         
         for i, result in enumerate(sorted_losers):
-            if result['profit'] < 0:  # Only show actual losers
+            if isinstance(result, dict) and result.get('profit', 0) < 0:  # Only show actual losers
                 entries.append(
-                    f"{medals[i]} {result['username']}: {result['profit']:,} 🧂"
+                    f"{medals[i]} {result.get('username', 'Unknown')}: {result.get('profit', 0):,} 🧂"
                 )
         
         if entries:
@@ -568,89 +824,115 @@ class BettingBot(commands.Bot):
 
 
 
-
-
-    @commands.command(name='units')
-    async def civs_command(self, ctx):
-        """Show available unit specializations"""
-        basic_info = "⚔️ AVAILABLE UNITS (200 salt to pick) ⚔️"
+    # @commands.command(name='units')
+    # async def civs_command(self, ctx):
+    #     """Show available unit specializations"""
+    #     basic_info = "⚔️ AVAILABLE UNITS (200 salt to pick) ⚔️"
         
-        unit_list = (
-            f"{self.civ_manager.CIVILIZATIONS['archer'].badge} Archer: +30% !pound rewards\n"
-            f"{self.civ_manager.CIVILIZATIONS['infantry'].badge} Infantry: 40% faster !pound cooldown\n"
-            f"{self.civ_manager.CIVILIZATIONS['cavalry'].badge} Cavalry: Double rewards, 50% longer cooldown\n"
-            f"{self.civ_manager.CIVILIZATIONS['eagle'].badge} Eagle: 30% cheaper techs"
-        )
+    #     unit_list = (
+    #         f"{self.civ_manager.CIVILIZATIONS['archer'].badge} Archer: +30% !pound rewards\n"
+    #         f"{self.civ_manager.CIVILIZATIONS['infantry'].badge} Infantry: 40% faster !pound cooldown\n"
+    #         f"{self.civ_manager.CIVILIZATIONS['cavalry'].badge} Cavalry: Double rewards, 50% longer cooldown\n"
+    #         f"{self.civ_manager.CIVILIZATIONS['eagle'].badge} Eagle: 30% cheaper techs"
+    #     )
 
-        await ctx.send(basic_info)
-        await ctx.send(unit_list)
+    #     await ctx.send(basic_info)
+    #     await ctx.send(unit_list)
 
-    @commands.command(name='unit')
-    async def civ_command(self, ctx, unit_type: str = None):
-        """Select or view unit type"""
-        user_id = str(ctx.author.id)
+    # @commands.command(name='unit')
+    # async def civ_command(self, ctx, unit_type: str = None):
+    #     """Select or view unit type"""
+    #     user_id = str(ctx.author.id)
         
-        # If no unit specified, show current unit
-        if not unit_type:
-            current_unit = self.civ_manager.get_user_civ(user_id)
-            if current_unit:
-                await ctx.send(f"@{ctx.author.name} You are specialized in {current_unit.name} {current_unit.badge}")
-            else:
-                await ctx.send(f"@{ctx.author.name} You haven't selected a unit type yet. Use !units to see options")
-            return
+    #     # If no unit specified, show current unit
+    #     if not unit_type:
+    #         current_unit = self.civ_manager.get_user_civ(user_id)
+    #         if current_unit:
+    #             await ctx.send(f"@{ctx.author.name} You are specialized in {current_unit.name} {current_unit.badge}")
+    #         else:
+    #             await ctx.send(f"@{ctx.author.name} You haven't selected a unit type yet. Use !units to see options")
+    #         return
 
-        # Force lowercase for consistency with our stored values
-        unit_type = unit_type.lower()
+    #     # Force lowercase for consistency with our stored values
+    #     unit_type = unit_type.lower()
 
-        # Check if user already has a unit type
-        current_unit = self.civ_manager.get_user_civ(user_id)
-        cost = 1000 if current_unit else 200  # Switch cost vs initial cost
+    #     # Check if user already has a unit type
+    #     current_unit = self.civ_manager.get_user_civ(user_id)
+    #     cost = 1000 if current_unit else 200  # Switch cost vs initial cost
         
-        # Check if user has enough salt
-        if self.user_points.get(user_id, 0) < cost:
-            await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch unit type' if current_unit else 'select a unit type'}")
-            return
+    #     # Check if user has enough salt
+    #     if self.user_points.get(user_id, 0) < cost:
+    #         await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch unit type' if current_unit else 'select a unit type'}")
+    #         return
 
-        # Try to select unit type
-        success, message = self.civ_manager.select_civilization(user_id, unit_type)
-        if success:
-            # Deduct salt
-            self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
-            await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
-            self.save_points()
-        else:
-            await ctx.send(f"@{ctx.author.name} {message}")
+    #     # Try to select unit type
+    #     success, message = self.civ_manager.select_civilization(user_id, unit_type)
+    #     if success:
+    #         # Deduct salt
+    #         self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
+    #         await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
+    #         self.save_points()
+    #     else:
+    #         await ctx.send(f"@{ctx.author.name} {message}")
 
-            # Check if user already has a civ
-            current_civ = self.civ_manager.get_user_civ(user_id)
-            cost = 1000 if current_civ else 200  # Switch cost vs initial cost
+    #         # Check if user already has a civ
+    #         current_civ = self.civ_manager.get_user_civ(user_id)
+    #         cost = 1000 if current_civ else 200  # Switch cost vs initial cost
             
-            # Check if user has enough salt
-            if self.user_points.get(user_id, 0) < cost:
-                await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch civilizations' if current_civ else 'select a civilization'}")
-                return
+    #         # Check if user has enough salt
+    #         if self.user_points.get(user_id, 0) < cost:
+    #             await ctx.send(f"@{ctx.author.name} You need {cost} salt to {'switch civilizations' if current_civ else 'select a civilization'}")
+    #             return
 
-            # Try to select civilization
-            success, message = self.civ_manager.select_civilization(user_id, civilization)
-            if success:
-                # Deduct salt
-                self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
-                await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
-                self.save_points()
-            else:
-                await ctx.send(f"@{ctx.author.name} {message}")
-
+    #         # Try to select civilization
+    #         success, message = self.civ_manager.select_civilization(user_id, civilization)
+    #         if success:
+    #             # Deduct salt
+    #             self.user_points[user_id] = self.user_points.get(user_id, 0) - cost
+    #             await ctx.send(f"@{ctx.author.name} {message} (-{cost} salt)")
+    #             self.save_points()
+    #         else:
+    #             await ctx.send(f"@{ctx.author.name} {message}")
     @commands.command(name='profile')
-    async def myciv_command(self, ctx):
-        """Show detailed information about your civilization"""
+    async def profile_command(self, ctx):
+        """Show player profile in a single, condensed message"""
         user_id = str(ctx.author.id)
-        civ = self.civ_manager.get_user_civ(user_id)
         
-        if not civ:
-            await ctx.send(f"@{ctx.author.name} You haven't selected a Unit type yet. Use !units to see options")
+        if user_id not in self.user_points:
+            await ctx.send(f"@{ctx.author.name} No profile found. Get started with !pound to claim salt!")
             return
-
-        await ctx.send(
-            f"@{ctx.author.name} UnitType: {civ.badge} {civ.name}\n"
-            f"Bonus: {civ.description}"
-        )
+        
+        player = self.user_points[user_id]
+        
+        if not isinstance(player, Player):
+            # Convert old format for display purposes
+            points = player
+            age = "Dark"
+            wins = 0
+            losses = 0
+            biggest_win = 0
+            biggest_loss = 0
+        else:
+            # Use Player object data
+            points = player.points
+            age = player.age
+            wins = player.wins
+            losses = player.losses
+            biggest_win = player.biggest_win
+            biggest_loss = player.biggest_loss
+        
+        # Calculate win rate
+        total_bets = wins + losses
+        win_rate = (wins / total_bets * 100) if total_bets > 0 else 0
+        
+        # Format a single, condensed message
+        betting_stats = f" | W/L: {wins}/{losses}" if total_bets > 0 else ""
+        winrate_stats = f" ({win_rate:.1f}%)" if total_bets > 0 else ""
+        
+        record_stats = ""
+        if total_bets > 0:
+            record_stats = f" | Best Win: {biggest_win:,} | Worst Loss: {biggest_loss:,}"
+        
+        message = f"@{ctx.author.name} [{age} Age] Salt: {points:,}{betting_stats}{winrate_stats}{record_stats}"
+        
+        await ctx.send(message)

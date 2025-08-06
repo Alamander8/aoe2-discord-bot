@@ -29,12 +29,20 @@ def capture_screen(bbox):
     """
     Captures a portion of the screen defined by bbox.
     """
+    screenshot = None
     try:
         screenshot = ImageGrab.grab(bbox=bbox)
-        return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+        # Convert to numpy array while we have the screenshot
+        frame = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+        return frame
     except Exception as e:
         log_error(f"Error capturing screen: {e}")
         return None
+    finally:
+        # CRITICAL: Always close the PIL image to prevent memory leak
+        if screenshot:
+            screenshot.close()
+            del screenshot
 
 def calculate_distance(pos1, pos2):
     """

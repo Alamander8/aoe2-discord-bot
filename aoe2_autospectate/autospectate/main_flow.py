@@ -21,8 +21,8 @@ from obs_control import create_obs_manager
 from betting_bridge import BettingBridge
 from windows_management import * 
 from windows_management import switch_to_captureage
-
-
+from simple_memory_monitor import SimpleMemoryMonitor
+from simple_restart_helper import SimpleRestartHelper
 
 
 class MainFlow:
@@ -39,7 +39,12 @@ class MainFlow:
         self.state_manager = StateManager()
         self.health_checker = HealthCheck()
         self.recovery_manager = RecoveryManager(self)
-        
+        self.restart_helper = SimpleRestartHelper()
+        self.restart_helper.capture_age_path = r"C:\Users\Alex Hogancamp\AppData\Local\Programs\CaptureAge\CaptureAge.exe"
+        self.restart_manager = RestartManager(self.restart_helper)
+
+        self.memory_monitor = SimpleMemoryMonitor()
+
         # Core configuration
         self.game_window_title = "CaptureAge"
         self.companion_url = getattr(config, 'AOE2_COMPANION_URL', 'https://www.aoe2companion.com/ongoing')
@@ -79,6 +84,14 @@ class MainFlow:
         log_dir.mkdir(exist_ok=True)
         setup_logging(Path('logs/main_flow.log'))
         logging.info("MainFlow initialized")
+
+    def manual_restart(self):
+        """Call this if you want to manually restart"""
+        logging.info("🔧 Manual restart requested")
+        if self.restart_manager.perform_restart("manual"):
+            return True
+        return False
+
 
     def ensure_scene_transition(self, target_scene):
         """Ensure proper scene transition with validation and retry logic."""
@@ -191,39 +204,44 @@ class MainFlow:
             return False
 
     def setup_game_view(self) -> bool:
-        """Setup the game view with correct camera settings."""
+        """Setup the game view with correct camera settings using mouse wheel zoom."""
         try:
             logging.info("Setting up game view...")
             
-            # Small initial delay to ensure window is ready
-            time.sleep(0.2)
+            # Set default orientation
+            logging.info("Setting default orientation (Alt+D)")
+            pyautogui.hotkey('alt', 'd')
+            time.sleep(0.8)  # Longer delay to ensure it processes
             
-            # Use individual key presses instead of hotkeys to avoid Alt focus issues
-            pyautogui.keyDown('alt')
-            time.sleep(0.1)
-            pyautogui.press('d')
-            time.sleep(0.1)
-            pyautogui.keyUp('alt')
+            # Set fixed camera
+            logging.info("Setting fixed camera (Alt+F)")
+            pyautogui.hotkey('alt', 'f')
+            time.sleep(0.8)
+            
+            # Use mouse wheel to zoom out instead of broken number keys
+            logging.info("Zooming out with mouse wheel...")
+            
+            # Get screen center for mouse position (using config values)
+            screen_center_x = self.config.GAME_AREA_WIDTH // 2
+            screen_center_y = self.config.GAME_AREA_HEIGHT // 2
+            
+            # Move mouse to center of game area
+            pyautogui.moveTo(screen_center_x, screen_center_y, duration=0.2)
             time.sleep(0.3)
             
-            pyautogui.keyDown('alt')
-            time.sleep(0.1)
-            pyautogui.press('f')
-            time.sleep(0.1)
-            pyautogui.keyUp('alt')
-            time.sleep(0.3)
+            # Scroll out several times to get a good zoom level
+            for i in range(20):
+                pyautogui.scroll(-12)  # -12 = -3 × 4 for quadruple zoom
+                time.sleep(0.2)
+                logging.info(f"Zoom scroll {i+1}/6")
             
-            # Set zoom level
-            pyautogui.press('3')
-            time.sleep(0.3)
-            
-            # Remove the extra window switch since we should still be focused
+            logging.info("Game view setup completed with mouse wheel zoom")
             return True
-                
+            
         except Exception as e:
             logging.error(f"Error setting up game view: {e}")
             return False
-        
+
 
     def verify_player_colors(self) -> Tuple[bool, bool]:
         """Verify if players are set to correct colors."""
@@ -268,6 +286,7 @@ class MainFlow:
 
     def check_color(self, x, y, target_color):
         """Check if pixel at (x,y) is the target color."""
+        screenshot = None
         try:
             bbox = (x - 5, y - 5, x + 5, y + 5)
             screenshot = ImageGrab.grab(bbox=bbox)
@@ -295,6 +314,11 @@ class MainFlow:
         except Exception as e:
             logging.error(f"Error checking color: {e}")
             return False
+        finally:
+            # CRITICAL: Always close the PIL image
+            if screenshot:
+                screenshot.close()
+                del screenshot
 
     def force_player_colors(self) -> bool:
         """Force players to Red and Blue colors in the bottom right UI."""
@@ -366,44 +390,68 @@ class MainFlow:
             return False
 
     def handle_game_end(self) -> bool:
-        """Handle game end cleanup with programmatic window management."""
+        """Enhanced game end handling with restart management"""
         try:
             logging.info("Starting game end cleanup sequence")
             
-            # Step 1: Switch OBS scene first
+            # Record successful game completion
+            self.restart_manager.record_game_completion()
+            
+            # Get memory status
+            memory_status = self.memory_monitor.check_and_log()
+            
+            # Check if we should restart
+            restart_reason = self.restart_manager.should_restart(memory_status)
+            if restart_reason:
+                logging.info(f" Restart needed due to: {restart_reason}")
+                
+                # Perform OBS cleanup first
+                self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
+                try:
+                    self.obs_manager.clear_match_text()
+                except Exception as e:
+                    logging.warning(f"Non-critical error clearing match text: {e}")
+                
+                # Perform restart
+                if self.restart_manager.perform_restart(restart_reason):
+                    return True
+                else:
+                    # Restart failed, check if we need nuclear option
+                    if self.restart_manager.should_nuclear_restart():
+                        logging.critical("🚨 Performing nuclear restart...")
+                        self.restart_helper.restart_python_script()
+                        return False  # Won't reach here
+            
+            # Normal game end cleanup (existing code)
             self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
             time.sleep(1)
 
-            # Step 2: Clear match text (non-critical)
             try:
                 self.obs_manager.clear_match_text()
             except Exception as e:
                 logging.warning(f"Non-critical error clearing match text: {e}")
 
-            # Step 3: Ensure AoE2 window focus
+            # AoE2 window cleanup
             aoe2_window = "Age of Empires II: Definitive Edition"
-            
             if not ensure_window_focus(aoe2_window):
                 logging.error("Failed to focus AoE2 window")
+                self.restart_manager.record_failure()
                 return False
                 
-            # Step 4: Send menu navigation commands
-            time.sleep(1)  # Wait for window to be ready
+            # Send menu navigation commands
+            time.sleep(1)
             logging.info("Sending menu navigation commands")
             
-            # First sequence
             pyautogui.press('tab')
             time.sleep(1.0)
             pyautogui.press('enter')
             time.sleep(1.5)
             
-            # Second sequence
             pyautogui.press('esc')
             time.sleep(1.0)
             pyautogui.press('enter')
             time.sleep(1.5)
             
-            # Final sequence
             pyautogui.press('esc')
             time.sleep(1.0)
             pyautogui.press('esc')
@@ -411,12 +459,11 @@ class MainFlow:
             
             logging.info("Game end cleanup completed successfully")
             return True
-                
+                    
         except Exception as e:
             logging.error(f"Error during game end cleanup: {e}")
+            self.restart_manager.record_failure()
             return False
-
-
 
     def run_spectator(self) -> bool:
         """Initialize and run the spectator core."""
@@ -447,7 +494,8 @@ class MainFlow:
             
             logging.info("Starting spectator core...")
             spectator_result = self.spectator_core.run_spectator()
-            
+            self.spectator_core.cleanup_between_games()
+
             if spectator_result:
                 logging.info("Game ended normally")
             else:
@@ -457,23 +505,45 @@ class MainFlow:
             
         except Exception as e:
             logging.error(f"Error in spectator core: {e}")
+            # Clean up even if there was an error
+            if hasattr(self, 'spectator_core'):
+                self.spectator_core.cleanup_between_games()
             return False
 
+
     def main_loop(self):
-        """Enhanced main loop with state management and recovery."""
+        """Enhanced main loop with restart management and recovery."""
         try:
             self.state_manager.transition_to(GameState.FINDING_GAME)
             
             while True:
                 try:
+                    # Check for nuclear restart condition first
+                    if self.restart_manager.should_nuclear_restart():
+                        logging.critical("🚨 Nuclear restart condition met")
+                        self.restart_helper.restart_python_script()
+                        return  # Won't reach here
+                    
                     # Regular health check
                     if not self.health_checker.perform_full_health_check(self.obs_manager):
-                        raise Exception("Health check failed")
+                        logging.error("Health check failed")
+                        self.restart_manager.record_failure()
+                        # Don't immediately fail, try to continue
+
+                    # Memory monitoring with nuclear option
+                    memory_status = self.memory_monitor.check_and_log()
+                    if memory_status == "NUCLEAR":
+                        logging.critical("🚨 NUCLEAR MEMORY LEVEL - RESTARTING SCRIPT!")
+                        self.restart_helper.restart_python_script()
+                    elif memory_status == "CRITICAL":
+                        logging.error("Consider restarting soon!")
+                        # The restart manager will catch this in should_restart()
 
                     # State timeout check with recovery
                     if recovery_state := self.state_manager.handle_timeout():
                         if recovery_state == GameState.ERROR:
                             if not self.recovery_manager.attempt_recovery(self.state_manager.current_state):
+                                self.restart_manager.record_failure()
                                 time.sleep(5)
                                 continue
                         else:
@@ -486,6 +556,7 @@ class MainFlow:
                     if current_state == GameState.FINDING_GAME:
                         logging.info("Finding new game...")
                         if not self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME']):
+                            self.restart_manager.record_failure()
                             time.sleep(5)
                             continue
 
@@ -502,11 +573,11 @@ class MainFlow:
                             
                             if not self.obs_manager.update_match_text(match_info):
                                 logging.error("Failed to update match text")
+                                # Non-critical, continue
 
                             self.state_manager.transition_to(GameState.GAME_FOUND)
 
                     elif current_state == GameState.GAME_FOUND:
-
                         if self.wait_for_game_load():
                             self.state_manager.transition_to(GameState.LOADING_GAME)
 
@@ -520,6 +591,11 @@ class MainFlow:
                             capture_age_attempts += 1
                             logging.warning(f"Failed to switch to CaptureAge window, attempt {capture_age_attempts}/5")
                             time.sleep(5)
+                        
+                        if capture_age_attempts >= 5:
+                            logging.error("Failed to switch to CaptureAge after 5 attempts")
+                            self.restart_manager.record_failure()
+                            self.state_manager.transition_to(GameState.ERROR)
 
                     elif current_state == GameState.SETTING_UP_VIEW:
                         if self.force_player_colors() and self.setup_game_view():
@@ -529,9 +605,16 @@ class MainFlow:
                                 self.state_manager.transition_to(GameState.SPECTATING)
                         else:
                             logging.error("Failed to setup game view")
+                            self.restart_manager.record_failure()
+                            self.state_manager.transition_to(GameState.ERROR)
 
                     elif current_state == GameState.SPECTATING:
-                        if self.run_spectator():
+                        spectator_result = self.run_spectator()
+                        if spectator_result:
+                            self.state_manager.transition_to(GameState.GAME_ENDED)
+                        else:
+                            logging.warning("Spectator ended unexpectedly")
+                            self.restart_manager.record_failure()
                             self.state_manager.transition_to(GameState.GAME_ENDED)
 
                     elif current_state == GameState.GAME_ENDED:
@@ -539,23 +622,158 @@ class MainFlow:
                             logging.info(f"Waiting {self.between_games_delay}s before next game...")
                             time.sleep(self.between_games_delay)
                             self.state_manager.transition_to(GameState.FINDING_GAME)
+                        else:
+                            logging.error("Failed to handle game end properly")
+                            self.restart_manager.record_failure()
+                            # Try to continue anyway
+                            time.sleep(self.between_games_delay)
+                            self.state_manager.transition_to(GameState.FINDING_GAME)
 
                     elif current_state == GameState.ERROR:
+                        logging.info("In error state, attempting recovery...")
                         if self.recovery_manager.attempt_recovery(current_state):
                             self.state_manager.transition_to(GameState.FINDING_GAME)
+                            logging.info("Recovery successful, resuming operation")
                         else:
-                            time.sleep(5)
+                            logging.error("Recovery failed, will retry")
+                            self.restart_manager.record_failure()
+                            time.sleep(10)  # Longer wait in error state
 
                     time.sleep(0.1)  # Prevent CPU thrashing
                     
                 except Exception as e:
-                    logging.error(f"Error in main loop: {e}")
-                    self.state_manager.transition_to(GameState.ERROR)
+                    logging.error(f"Error in main loop iteration: {e}")
+                    import traceback
+                    logging.error(traceback.format_exc())
                     
+                    self.restart_manager.record_failure()
+                    
+                    # If we have too many failures, transition to error state
+                    if self.restart_manager.consecutive_failures >= 2:
+                        logging.warning("Too many consecutive failures, entering error state")
+                        self.state_manager.transition_to(GameState.ERROR)
+                    else:
+                        time.sleep(5)  # Brief pause before retry
+                        
+        except KeyboardInterrupt:
+            logging.info("Main loop stopped by user")
+            self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
+            try:
+                self.obs_manager.clear_match_text()
+            except:
+                pass
         except Exception as e:
             logging.error(f"Critical error in main loop: {e}")
-            self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
-            self.obs_manager.clear_match_text()
+            import traceback
+            logging.error(traceback.format_exc())
+            
+            # Attempt cleanup
+            try:
+                self.safe_scene_switch(self.obs_manager.scenes['FINDING_GAME'])
+                self.obs_manager.clear_match_text()
+            except:
+                pass
+            
+            # This is a critical failure
+            self.restart_manager.record_failure()
+            
+            # If we're in a really bad state, try nuclear restart
+            if self.restart_manager.should_nuclear_restart():
+                logging.critical("Critical error triggering nuclear restart")
+                self.restart_helper.restart_python_script()
+
+
+
+class RestartManager:
+    def __init__(self, restart_helper):
+        self.restart_helper = restart_helper
+        self.games_since_restart = 0
+        self.start_time = time.time()
+        self.last_memory_check = time.time()
+        
+        # Restart triggers
+        self.max_games = 30  # Restart every 5 games
+        self.max_runtime_hours = 12  # Force restart after 8 hours
+        self.memory_threshold_gb = 2.0  # Restart if memory > 3GB
+        self.consecutive_failures = 0
+        self.max_failures = 3  # Nuclear restart after 3 consecutive failures
+        
+    def should_restart(self, memory_status="OK"):
+        """Check if we should restart CaptureAge/processes"""
+        current_time = time.time()
+        runtime_hours = (current_time - self.start_time) / 3600
+        
+        # Game count trigger
+        if self.games_since_restart >= self.max_games:
+            logging.info(f" Restart trigger: Game count ({self.games_since_restart}/{self.max_games})")
+            return "games"
+        
+        # Runtime trigger
+        if runtime_hours >= self.max_runtime_hours:
+            logging.info(f" Restart trigger: Runtime ({runtime_hours:.1f}/{self.max_runtime_hours} hours)")
+            return "runtime"
+        
+        # Memory trigger
+        if memory_status == "CRITICAL":
+            logging.info(" Restart trigger: Critical memory usage")
+            return "memory"
+        
+        return None
+    
+    def should_nuclear_restart(self):
+        """Check if we need to restart the entire Python script"""
+        if self.consecutive_failures >= self.max_failures:
+            logging.critical(f" Nuclear restart trigger: {self.consecutive_failures} consecutive failures")
+            return True
+        return False
+    
+    def perform_restart(self, reason="scheduled"):
+        """Perform a controlled restart"""
+        try:
+            logging.info(f" Performing restart (reason: {reason})...")
+            
+            if self.restart_helper.restart_everything():
+                self.games_since_restart = 0
+                self.consecutive_failures = 0  # Reset failure count on successful restart
+                logging.info(" Restart successful")
+                time.sleep(15)  # Wait for processes to stabilize
+                return True
+            else:
+                self.consecutive_failures += 1
+                logging.error(f"Restart failed (failures: {self.consecutive_failures})")
+                return False
+                
+        except Exception as e:
+            self.consecutive_failures += 1
+            logging.error(f"Restart error: {e} (failures: {self.consecutive_failures})")
+            return False
+    
+    def record_game_completion(self):
+        """Call this after each game completes successfully"""
+        self.games_since_restart += 1
+        self.consecutive_failures = 0  # Reset on successful game
+        logging.info(f"Games since restart: {self.games_since_restart}/{self.max_games}")
+    
+    def record_failure(self):
+        """Call this when something fails"""
+        self.consecutive_failures += 1
+        logging.warning(f" : {self.consecutive_failures}/{self.max_failures}")
+    
+    def get_status(self):
+        """Get current restart manager status"""
+        current_time = time.time()
+        runtime_hours = (current_time - self.start_time) / 3600
+        
+        return {
+            'games_completed': self.games_since_restart,
+            'runtime_hours': runtime_hours,
+            'consecutive_failures': self.consecutive_failures,
+            'next_restart_games': self.max_games - self.games_since_restart,
+            'next_restart_hours': self.max_runtime_hours - runtime_hours
+        }
+
+
+
 
 def main():
     """Entry point."""

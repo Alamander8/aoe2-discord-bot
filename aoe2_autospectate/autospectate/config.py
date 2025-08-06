@@ -117,7 +117,7 @@ BUILDING_ICON_MIN_AREA = 15  # Minimum pixel area for TC/Castle icons
 BUILDING_ICON_MAX_AREA = 50  # Maximum pixel area
 BUILDING_ICON_MIN_CIRCULARITY = 0.6  # How circular the icon should be (1.0 is perfect circle)
 
-MIN_GAME_ELO=1050
+MIN_GAME_ELO=1100
 
 # Game settings
 MAX_PLAYERS = 8
